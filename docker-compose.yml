@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  # Backend service: FastAPI application
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    # Load environment variables from project .env
+    env_file: ./.env
+    ports:
+      - "8000:8000"  # Expose backend on host port 8000
+    volumes:
+      - ./backend:/app/backend  # Mount backend for hot-reload during development
+      - ./backend/requirements.txt:/app/requirements.txt
+    # Use uvicorn with reload for development. In production, run gunicorn/uvicorn without --reload
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload

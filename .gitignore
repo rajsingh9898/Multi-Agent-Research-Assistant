@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.env
+venv/
+.env
+*.egg-info/
+
+# VSCode
+.vscode/
+
+# Node
+node_modules/
+.next/
+dist/
+
+# Logs
+logs/
+*.log
+
+# Mac
+.DS_Store
+
+# Docker
+**/docker-compose.override.yml
+
+# Build outputs
+build/
+
+# Firebase service account
+path/to/serviceAccount.json
