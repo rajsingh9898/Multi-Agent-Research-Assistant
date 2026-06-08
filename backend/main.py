@@ -21,9 +21,12 @@ from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .utils.auth import save_user_to_firestore, verify_token
-from .utils.firebase_config import initialize_firebase
-from .utils.websocket_manager import connect, disconnect
+from tools.confidence import calculate_confidence_score, get_confidence_label
+from tools.credibility import calculate_average_credibility, rate_source_credibility
+from tools.pinecone_tool import get_index_stats, get_openai_client, get_pinecone_client
+from utils.auth import save_user_to_firestore, verify_token
+from utils.firebase_config import initialize_firebase
+from utils.websocket_manager import connect, disconnect
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -133,14 +136,79 @@ async def startup_event() -> None:
         initialize_firebase()
         logger.info("Firebase initialization completed")
     except Exception as exc:
-        logger.exception("Firebase initialization failed during startup")
-        raise RuntimeError(f"Firebase startup failed: {exc}") from exc
+        logger.warning("Firebase initialization failed during startup: %s", exc)
+        logger.warning("Continuing startup so the rest of the project can run")
 
 
 @app.get("/healthz", tags=["health"])
 async def health_check() -> Dict[str, Any]:
     """Return a lightweight health check response for uptime monitoring."""
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/api/health/pinecone", tags=["health"])
+async def health_pinecone() -> Dict[str, Any]:
+    """Return Pinecone index health and readiness information."""
+    stats = get_index_stats()
+    return {
+        "service": "pinecone",
+        "status": stats.get("status", "unknown"),
+        "ready": stats.get("status") not in {"error", "unknown"},
+        "stats": stats,
+    }
+
+
+@app.get("/api/health/all", tags=["health"])
+async def health_all() -> Dict[str, Any]:
+    """Return a consolidated status payload for all configured services."""
+    services: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        initialize_firebase()
+        services["firebase"] = {"status": "ready", "message": "Firebase initialized"}
+    except Exception as exc:
+        services["firebase"] = {"status": "error", "message": str(exc)}
+
+    try:
+        get_openai_client()
+        services["openai"] = {"status": "ready", "message": "OpenAI client initialized"}
+    except Exception as exc:
+        services["openai"] = {"status": "error", "message": str(exc)}
+
+    try:
+        get_pinecone_client()
+        services["pinecone"] = {"status": "ready", "message": "Pinecone client initialized", "stats": get_index_stats()}
+    except Exception as exc:
+        services["pinecone"] = {"status": "error", "message": str(exc), "stats": get_index_stats()}
+
+    tavily_api_key = os.getenv("TAVILY_API_KEY")
+    services["tavily"] = {
+        "status": "ready" if tavily_api_key else "missing",
+        "message": "Tavily API key configured" if tavily_api_key else "TAVILY_API_KEY is not set",
+    }
+
+    sample_sources = [
+        rate_source_credibility("https://www.nature.com/articles/d41586-024-00001-0"),
+        rate_source_credibility("https://www.reuters.com/world/"),
+    ]
+    sample_state = {
+        "source_credibility": sample_sources,
+        "verified_claims": [{"verified": True}, {"verified": False}],
+    }
+
+    return {
+        "service": "all",
+        "status": "ready"
+        if all(item["status"] == "ready" for item in services.values())
+        else "degraded",
+        "services": services,
+        "confidence_example": {
+            "score": calculate_confidence_score(sample_state),
+            "label": get_confidence_label(calculate_confidence_score(sample_state)),
+            "average_credibility": calculate_average_credibility(sample_sources),
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.post("/api/auth/login", response_model=AuthUserResponse, tags=["auth"])
