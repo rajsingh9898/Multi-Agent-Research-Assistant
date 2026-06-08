@@ -6,7 +6,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     # Load environment variables from project .env
-    env_file: ./.env
+    env_file: ./backend/.env
     ports:
       - "8000:8000"  # Expose backend on host port 8000
     volumes:

@@ -4,6 +4,9 @@ __pycache__/
 *.env
 venv/
 .env
+.env.local
+backend/.env
+frontend/.env.local
 *.egg-info/
 
 # VSCode
@@ -29,3 +32,13 @@ build/
 
 # Firebase service account
 path/to/serviceAccount.json
+backend/serviceaccount.json
+backend/serviceAccount.json
+backend/*serviceaccount*.json
+**/serviceaccount.json
+**/serviceAccount.json
+**/*serviceaccount*.json
+
+# Never commit generated or secret Firebase credential exports
+firebase-service-account.json
+*.service-account.json

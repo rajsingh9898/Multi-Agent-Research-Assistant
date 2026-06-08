@@ -1,332 +1,347 @@
-"""FastAPI main application for Multi-Agent Research Assistant
-This module provides:
-- FastAPI app with CORS and OpenAPI metadata
-- Pydantic request/response models used by the agents
-- Placeholder HTTP endpoints for the 6 agents
-- WebSocket endpoint to stream live agent events
+"""FastAPI application entry point for Multi-Agent Research Assistant.
 
-Replace placeholder logic with real agent implementations
-when wiring to LangChain / background tasks.
+This module wires together:
+- Firebase initialization on startup
+- Firebase auth login and user profile persistence
+- Protected API endpoints for research/report workflows
+- WebSocket placeholder endpoint for live agent updates
+- OpenAPI metadata and health checks
 """
 
-from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
+
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from datetime import datetime
-from dotenv import load_dotenv
-import os
 
-# Load environment variables from .env at startup
-load_dotenv()
+from .utils.auth import save_user_to_firestore, verify_token
+from .utils.firebase_config import initialize_firebase
+from .utils.websocket_manager import connect, disconnect
+
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
 
 API_TITLE = "Multi-Agent Research Assistant"
-API_VERSION = "0.1.0"
-API_DESCRIPTION = (
-    "Orchestrates multiple cooperating agents to produce a fully-cited, verified research report."
+API_VERSION = "1.0.0"
+API_DESCRIPTION = "FastAPI backend for a multi-agent research assistant with Firebase auth, reports, and live updates."
+
+app = FastAPI(
+    title=API_TITLE,
+    version=API_VERSION,
+    description=API_DESCRIPTION,
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
-app = FastAPI(title=API_TITLE, version=API_VERSION, description=API_DESCRIPTION)
-
-# CORS configuration - expand origins for production (use env var)
-origins = os.getenv("CORS_ORIGINS", "http://localhost,http://localhost:3000").split(",")
-
+# CORS is intentionally broad in development and should be narrowed in production.
+allowed_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[origin.strip() for origin in allowed_origins if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---------------------------
-# Pydantic models (requests/responses)
-# ---------------------------
+class AuthLoginRequest(BaseModel):
+    """Request body for Firebase login exchange."""
+
+    id_token: str = Field(..., description="Firebase ID token returned by the client SDK")
+
+
+class AuthUserResponse(BaseModel):
+    """Normalized authenticated user payload returned by the backend."""
+
+    uid: str
+    email: Optional[str] = None
+    display_name: Optional[str] = None
+    photo_url: Optional[str] = None
+    email_verified: bool = False
+    created_at: Optional[str] = None
+    last_login_at: Optional[str] = None
+
 
 class ResearchStartRequest(BaseModel):
-    topic: str = Field(..., description="Research topic string")
+    """Request body to start a new research run."""
+
+    topic: str = Field(..., min_length=2)
     depth: str = Field("deep", description="quick | deep | expert")
     language: str = Field("english", description="english | hindi | spanish")
-    user_id: Optional[str] = Field(None, description="Firebase user id")
 
 
 class ResearchStatusResponse(BaseModel):
+    """Response returned when a research run is created or queried."""
+
     report_id: str
     status: str
-    current_agent: Optional[str]
-    progress: Optional[int] = 0
+    current_agent: Optional[str] = None
+    progress: int = 0
 
 
-class SubQuestionsRequest(BaseModel):
-    topic: str
-    depth: Optional[str] = "deep"
+class ReportDataResponse(BaseModel):
+    """Stored report data returned from the API."""
 
-
-class SubQuestionsResponse(BaseModel):
-    report_id: Optional[str]
-    sub_questions: List[str]
-
-
-class SearchRequest(BaseModel):
     report_id: str
-    sub_questions: List[str]
-
-
-class SearchResultItem(BaseModel):
-    url: str
-    title: Optional[str]
-    snippet: Optional[str]
-    credibility: Optional[str] = Field(None, description="Academic | News | Blog | Unknown")
-
-
-class SearchResponse(BaseModel):
-    report_id: str
-    results: Dict[str, List[SearchResultItem]]
-
-
-class SummaryItem(BaseModel):
-    sub_question: str
-    summary: str
-    citations: List[SearchResultItem]
-
-
-class SummariesResponse(BaseModel):
-    report_id: str
-    summaries: List[SummaryItem]
-
-
-class ClaimItem(BaseModel):
-    claim: str
-    label: str = Field(..., description="verified | uncertain | unverified")
-    confidence: int = Field(..., ge=0, le=100)
-    supporting_sources: List[SearchResultItem]
-
-
-class VerifiedClaimsResponse(BaseModel):
-    report_id: str
-    claims: List[ClaimItem]
-
-
-class FinalReportRequest(BaseModel):
-    report_id: str
-    topic: str
-    language: Optional[str] = "english"
-
-
-class FinalReportResponse(BaseModel):
-    report_id: str
-    title: str
-    markdown: str
-    confidence_score: int
-    source_credibility: Dict[str, str]
-
-
-class FollowUpResponse(BaseModel):
-    report_id: str
-    followup_questions: List[str]
-
-
-# Agent state model for storage / Firestore
-class AgentState(BaseModel):
-    report_id: str
+    user_id: str
     topic: str
     depth: str
     language: str
-    user_id: Optional[str]
-    sub_questions: List[str] = []
-    search_results: Dict[str, List[Dict[str, Any]]] = {}
-    summaries: List[Dict[str, Any]] = []
-    verified_claims: List[Dict[str, Any]] = []
-    final_report: Optional[Dict[str, Any]] = None
-    followup_questions: List[str] = []
+    status: str
     confidence_score: int = 0
-    source_credibility: Dict[str, str] = {}
-    thinking_logs: List[Dict[str, Any]] = []
-    status: str = "pending"
-    current_agent: Optional[str] = None
+    source_credibility: List[Dict[str, Any]] = Field(default_factory=list)
+    thinking_logs: List[Dict[str, Any]] = Field(default_factory=list)
+    followup_questions: List[str] = Field(default_factory=list)
+    report_markdown: str = ""
+    created_at: str
+    completed_at: Optional[str] = None
 
 
-# In-memory store for demo (replace with Firestore in production)
-IN_MEMORY_REPORTS: Dict[str, Dict[str, Any]] = {}
+class PDFExportRequest(BaseModel):
+    """Request body for generating a PDF from a report."""
+
+    report_id: str
 
 
-# WebSocket connection manager (simple helper functions)
-from .utils.websocket_manager import connect, disconnect, broadcast
+class WebSocketMessage(BaseModel):
+    """Simple schema for placeholder WebSocket events."""
+
+    event: str
+    agent: Optional[str] = None
+    message: Optional[str] = None
+    thought: Optional[str] = None
+    report_id: Optional[str] = None
 
 
-# ---------------------------
-# API Endpoints
-# ---------------------------
+# In-memory storage keeps the starter project runnable before Firestore wiring is complete.
+REPORT_STORE: Dict[str, Dict[str, Any]] = {}
 
 
-@app.post("/api/research/start", response_model=ResearchStatusResponse, tags=["research"])
-async def start_research(payload: ResearchStartRequest, background_tasks: BackgroundTasks):
-    """Start the multi-agent research workflow.
-    Creates a `report_id`, initializes `AgentState`, and enqueues background tasks
-    (background task wiring is placeholder — implement orchestration with Celery / BackgroundTasks / Cloud Tasks).
-    """
-    report_id = f"rpt_{int(datetime.utcnow().timestamp())}"
-    state = AgentState(
-        report_id=report_id,
-        topic=payload.topic,
-        depth=payload.depth,
-        language=payload.language,
-        user_id=payload.user_id,
-        status="pending",
-        current_agent="orchestrator",
-    )
-    IN_MEMORY_REPORTS[report_id] = state.dict()
-
-    # TODO: schedule background orchestration that runs the 6 agents in sequence
-
-    return ResearchStatusResponse(report_id=report_id, status="pending", current_agent="orchestrator", progress=0)
-
-
-@app.post("/api/agent/orchestrator", response_model=SubQuestionsResponse, tags=["agents"])
-async def orchestrator(req: SubQuestionsRequest):
-    """Generates sub-questions for a topic based on `depth`.
-    Placeholder uses simple heuristics; replace with GPT-4o calls.
-    """
-    # Simple placeholder splitting - replace with real LLM prompt
-    base = req.topic.strip()
-    sub_questions = [f"What is the history of {base}?", f"What are the current challenges in {base}?", f"What are future directions for {base}?"]
-    return SubQuestionsResponse(report_id=None, sub_questions=sub_questions)
-
-
-@app.post("/api/agent/search", response_model=SearchResponse, tags=["agents"])
-async def search_agent(req: SearchRequest):
-    """Searches the web for each sub-question using Tavily (placeholder).
-    Returns a mapping sub_question -> list of `SearchResultItem` with credibility tagging.
-    """
-    results: Dict[str, List[SearchResultItem]] = {}
-    for sq in req.sub_questions:
-        # Placeholder single synthetic result
-        item = SearchResultItem(url="https://example.com", title=f"Result for: {sq}", snippet="Snippet...", credibility="Unknown")
-        results[sq] = [item]
-    return SearchResponse(report_id=req.report_id, results=results)
-
-
-@app.post("/api/agent/summary", response_model=SummariesResponse, tags=["agents"])
-async def summary_agent(req: SearchRequest):
-    """Summarizes search results for each sub-question using RAG.
-    Placeholder: returns short summaries referencing the first result.
-    """
-    summaries: List[SummaryItem] = []
-    for sq in req.sub_questions:
-        summaries.append(SummaryItem(sub_question=sq, summary=f"Short summary for {sq}", citations=[]))
-    return SummariesResponse(report_id=req.report_id, summaries=summaries)
-
-
-@app.post("/api/agent/factcheck", response_model=VerifiedClaimsResponse, tags=["agents"])
-async def factcheck_agent(req: SummariesResponse):
-    """Extracts claims and cross verifies across sources.
-    Placeholder: marks everything as 'uncertain' with 50% confidence.
-    """
-    claims: List[ClaimItem] = []
-    for s in req.summaries:
-        claims.append(ClaimItem(claim=f"Claim from {s.sub_question}", label="uncertain", confidence=50, supporting_sources=[]))
-    return VerifiedClaimsResponse(report_id=req.report_id, claims=claims)
-
-
-@app.post("/api/agent/writer", response_model=FinalReportResponse, tags=["agents"])
-async def writer_agent(req: FinalReportRequest):
-    """Composes the final report in markdown with inline citations and computes confidence score.
-    Placeholder: returns a simple markdown document.
-    """
-    markdown = f"# {req.topic}\n\nThis is a starter report for {req.topic}. Replace with real generated content."
-    return FinalReportResponse(report_id=req.report_id, title=req.topic, markdown=markdown, confidence_score=60, source_credibility={})
-
-
-@app.post("/api/agent/followup", response_model=FollowUpResponse, tags=["agents"])
-async def followup_agent(req: FinalReportRequest):
-    """Suggests follow-up research questions based on the final report.
-    Placeholder returns three follow-up items.
-    """
-    followups = [f"Deep dive into methodology for {req.topic}", f"Compare {req.topic} across regions", f"Investigate ethical implications of {req.topic}"]
-    return FollowUpResponse(report_id=req.report_id, followup_questions=followups)
-
-
-@app.post("/api/export/pdf")
-async def export_pdf_endpoint(req: Dict[str, str]):
-    """Generate PDF for a report. Returns URL to the generated PDF.
-    Placeholder implements a call into `tools.pdf_export`.
-    """
-    report_id = req.get("report_id")
-    rpt = IN_MEMORY_REPORTS.get(report_id)
-    if not rpt or not rpt.get("final_report"):
-        raise HTTPException(status_code=404, detail="Report not found or not ready")
-
-    from .tools.pdf_export import export_pdf
-    out_path = os.path.abspath(f"./tmp/{report_id}.pdf")
-    # Ensure directory exists
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    export_pdf(rpt.get("final_report",""), out_path)
-    return {"pdf_url": f"file://{out_path}"}
-
-
-@app.get("/api/research/{report_id}", response_model=AgentState, tags=["research"])
-async def get_report(report_id: str):
-    """Fetch the full agent state for a report_id. In production, pull from Firestore.
-    """
-    r = IN_MEMORY_REPORTS.get(report_id)
-    if not r:
-        raise HTTPException(status_code=404, detail="Report not found")
-    return AgentState(**r)
-
-
-@app.get("/api/reports/history", response_model=List[ResearchStatusResponse], tags=["research"])
-async def reports_history(user_id: Optional[str] = None):
-    """Return a list of recent reports. Filter by user_id when provided.
-    For starter code this returns in-memory entries.
-    """
-    out: List[ResearchStatusResponse] = []
-    for rid, v in IN_MEMORY_REPORTS.items():
-        if user_id and v.get("user_id") != user_id:
-            continue
-        out.append(ResearchStatusResponse(report_id=rid, status=v.get("status","pending"), current_agent=v.get("current_agent"), progress=0))
-    return out
-
-
-@app.delete("/api/reports/{report_id}")
-async def delete_report(report_id: str):
-    """Delete a report and associated agent logs/storage. Placeholder removes from in-memory store."""
-    if report_id in IN_MEMORY_REPORTS:
-        del IN_MEMORY_REPORTS[report_id]
-        return {"ok": True}
-    raise HTTPException(status_code=404, detail="Report not found")
+@app.on_event("startup")
+async def startup_event() -> None:
+    """Initialize Firebase once when the application starts."""
+    try:
+        initialize_firebase()
+        logger.info("Firebase initialization completed")
+    except Exception as exc:
+        logger.exception("Firebase initialization failed during startup")
+        raise RuntimeError(f"Firebase startup failed: {exc}") from exc
 
 
 @app.get("/healthz", tags=["health"])
-async def health_check():
-    """Simple health check endpoint."""
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+async def health_check() -> Dict[str, Any]:
+    """Return a lightweight health check response for uptime monitoring."""
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-# WebSocket endpoint for live agent updates
+@app.post("/api/auth/login", response_model=AuthUserResponse, tags=["auth"])
+async def login_user(payload: AuthLoginRequest) -> AuthUserResponse:
+    """Verify a Firebase ID token and create/update the corresponding user profile."""
+    # Reuse the dependency logic by passing the bearer token into verify_token.
+    try:
+        from firebase_admin import auth as firebase_auth
+
+        decoded = firebase_auth.verify_id_token(payload.id_token)
+        user = {
+            "uid": decoded.get("uid"),
+            "email": decoded.get("email"),
+            "name": decoded.get("name"),
+            "picture": decoded.get("picture"),
+            "email_verified": decoded.get("email_verified", False),
+        }
+        saved_user = save_user_to_firestore(user)
+        return AuthUserResponse(
+            uid=saved_user["uid"],
+            email=saved_user.get("email"),
+            display_name=saved_user.get("displayName"),
+            photo_url=saved_user.get("photoURL"),
+            email_verified=bool(saved_user.get("emailVerified", False)),
+            created_at=saved_user.get("createdAtClient"),
+            last_login_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Login failed")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unable to verify Firebase token") from exc
+
+
+@app.get("/api/auth/me", response_model=AuthUserResponse, tags=["auth"])
+async def get_me(current_user: Dict[str, Any] = Depends(verify_token)) -> AuthUserResponse:
+    """Return the current authenticated user from the Firebase token."""
+    return AuthUserResponse(
+        uid=current_user["uid"],
+        email=current_user.get("email"),
+        display_name=current_user.get("name"),
+        photo_url=current_user.get("picture"),
+        email_verified=bool(current_user.get("email_verified", False)),
+    )
+
+
+@app.post("/api/research/start", response_model=ResearchStatusResponse, tags=["research"])
+async def start_research(
+    payload: ResearchStartRequest,
+    current_user: Dict[str, Any] = Depends(verify_token),
+) -> ResearchStatusResponse:
+    """Create a new research job placeholder owned by the authenticated user."""
+    report_id = f"rpt_{uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    REPORT_STORE[report_id] = {
+        "report_id": report_id,
+        "user_id": current_user["uid"],
+        "topic": payload.topic,
+        "depth": payload.depth,
+        "language": payload.language,
+        "status": "pending",
+        "current_agent": "orchestrator",
+        "progress": 0,
+        "confidence_score": 0,
+        "source_credibility": [],
+        "thinking_logs": [],
+        "followup_questions": [],
+        "report_markdown": "",
+        "created_at": now,
+        "completed_at": None,
+    }
+    return ResearchStatusResponse(report_id=report_id, status="pending", current_agent="orchestrator", progress=0)
+
+
+@app.get("/api/research/{report_id}", response_model=ReportDataResponse, tags=["research"])
+async def get_report(
+    report_id: str,
+    current_user: Dict[str, Any] = Depends(verify_token),
+) -> ReportDataResponse:
+    """Return a report only if it belongs to the authenticated user."""
+    report = REPORT_STORE.get(report_id)
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+    if report["user_id"] != current_user["uid"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this report")
+    return ReportDataResponse(**report)
+
+
+@app.get("/api/reports/history", response_model=List[ResearchStatusResponse], tags=["research"])
+async def get_history(current_user: Dict[str, Any] = Depends(verify_token)) -> List[ResearchStatusResponse]:
+    """Return the current user's recent reports."""
+    history: List[ResearchStatusResponse] = []
+    for report in REPORT_STORE.values():
+        if report["user_id"] != current_user["uid"]:
+            continue
+        history.append(
+            ResearchStatusResponse(
+                report_id=report["report_id"],
+                status=report["status"],
+                current_agent=report.get("current_agent"),
+                progress=int(report.get("progress", 0)),
+            )
+        )
+    return history
+
+
+@app.delete("/api/reports/{report_id}", tags=["research"])
+async def delete_report(
+    report_id: str,
+    current_user: Dict[str, Any] = Depends(verify_token),
+) -> Dict[str, str]:
+    """Delete a report only if it belongs to the current user."""
+    report = REPORT_STORE.get(report_id)
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+    if report["user_id"] != current_user["uid"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to delete this report")
+    del REPORT_STORE[report_id]
+    return {"message": "Report deleted"}
+
+
+@app.post("/api/export/pdf", tags=["export"])
+async def export_pdf(
+    payload: PDFExportRequest,
+    current_user: Dict[str, Any] = Depends(verify_token),
+) -> Dict[str, str]:
+    """Return a placeholder PDF URL for the authenticated user's report."""
+    report = REPORT_STORE.get(payload.report_id)
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+    if report["user_id"] != current_user["uid"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to export this report")
+    return {"pdf_url": f"/tmp/{payload.report_id}.pdf"}
+
+
 @app.websocket("/ws/research/{report_id}")
-async def websocket_endpoint(websocket: WebSocket, report_id: str):
-    """Accepts websocket connections and streams agent events for a report_id.
-    Clients should connect to `/ws/research/{report_id}` to receive JSON events
-    in the shape described in the project spec (agent_start, agent_update, etc.).
-    """
+async def research_websocket(websocket: WebSocket, report_id: str) -> None:
+    """Stream placeholder live updates for a specific report id."""
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4401)
+        return
+
+    try:
+        from firebase_admin import auth as firebase_auth
+
+        firebase_auth.verify_id_token(token)
+    except Exception:
+        await websocket.close(code=4401)
+        return
+
     await connect(report_id, websocket)
     try:
         while True:
-            data = await websocket.receive_text()
-            # Echo for now; real implementation will push agent events from background tasks
-            await websocket.send_json({"event": "echo", "message": data})
+            message = await websocket.receive_text()
+            await websocket.send_json(WebSocketMessage(event="echo", report_id=report_id, message=message).dict())
     except WebSocketDisconnect:
         await disconnect(report_id, websocket)
 
 
-# OpenAPI tags
+# Placeholder agent routes keep the endpoint structure ready for the Day 5 orchestration layer.
+@app.post("/api/agent/orchestrator", tags=["agents"])
+async def orchestrator_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
+    """Placeholder route for the orchestrator agent."""
+    return {"status": "pending", "agent": "orchestrator", "user_id": current_user["uid"]}
+
+
+@app.post("/api/agent/search", tags=["agents"])
+async def search_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
+    """Placeholder route for the search agent."""
+    return {"status": "pending", "agent": "search", "user_id": current_user["uid"]}
+
+
+@app.post("/api/agent/summary", tags=["agents"])
+async def summary_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
+    """Placeholder route for the summary agent."""
+    return {"status": "pending", "agent": "summary", "user_id": current_user["uid"]}
+
+
+@app.post("/api/agent/factcheck", tags=["agents"])
+async def factcheck_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
+    """Placeholder route for the fact-check agent."""
+    return {"status": "pending", "agent": "factcheck", "user_id": current_user["uid"]}
+
+
+@app.post("/api/agent/writer", tags=["agents"])
+async def writer_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
+    """Placeholder route for the writer agent."""
+    return {"status": "pending", "agent": "writer", "user_id": current_user["uid"]}
+
+
+@app.post("/api/agent/followup", tags=["agents"])
+async def followup_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
+    """Placeholder route for the follow-up agent."""
+    return {"status": "pending", "agent": "followup", "user_id": current_user["uid"]}
+
+
 app.openapi_tags = [
-    {"name": "research", "description": "Start and manage research reports"},
-    {"name": "agents", "description": "Individual agent endpoints (orchestrator, search, summary, factcheck, writer, followup)"},
-    {"name": "export", "description": "PDF export and utilities"},
-    {"name": "health", "description": "Health checks"},
+    {"name": "auth", "description": "Firebase login and current user endpoints"},
+    {"name": "research", "description": "Research lifecycle endpoints"},
+    {"name": "agents", "description": "Agent placeholders and orchestration hooks"},
+    {"name": "export", "description": "PDF export endpoints"},
+    {"name": "health", "description": "Health monitoring"},
 ]
-
-
-# To run locally: `uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000`
