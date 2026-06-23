@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from tools.confidence import calculate_confidence_score, get_confidence_label
 from tools.credibility import calculate_average_credibility, rate_source_credibility
 from tools.pinecone_tool import get_index_stats, get_openai_client, get_pinecone_client
+from tools.tavily_tool import search
 from utils.auth import save_user_to_firestore, verify_token
 from utils.firebase_config import initialize_firebase
 from utils.websocket_manager import connect, disconnect
@@ -156,6 +157,39 @@ async def health_pinecone() -> Dict[str, Any]:
         "ready": stats.get("status") not in {"error", "unknown"},
         "stats": stats,
     }
+
+
+@app.get("/api/health/tavily", tags=["health"])
+async def health_tavily() -> Dict[str, Any]:
+    """Return Tavily Search API health and connectivity status."""
+    api_key = os.getenv("TAVILY_API_KEY")
+    api_key_configured = bool(api_key and api_key.strip())
+
+    if not api_key_configured:
+        return {
+            "status": "error",
+            "api_key_configured": False,
+            "test_search_results": 0,
+            "message": "TAVILY_API_KEY is not configured in .env file."
+        }
+
+    try:
+        # Execute a test search query to verify Tavily connectivity
+        results = search(query="test query", max_results=1, search_depth="basic")
+        return {
+            "status": "healthy",
+            "api_key_configured": True,
+            "test_search_results": len(results),
+            "message": "Tavily search tool is online and fully configured."
+        }
+    except Exception as exc:
+        logger.exception("Tavily health check search failed")
+        return {
+            "status": "error",
+            "api_key_configured": True,
+            "test_search_results": 0,
+            "message": f"Tavily search connection error: {exc}"
+        }
 
 
 @app.get("/api/health/all", tags=["health"])
