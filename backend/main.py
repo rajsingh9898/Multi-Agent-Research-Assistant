@@ -27,7 +27,9 @@ from tools.pinecone_tool import get_index_stats, get_openai_client, get_pinecone
 from tools.tavily_tool import search
 from utils.auth import save_user_to_firestore, verify_token
 from utils.firebase_config import initialize_firebase
-from utils.websocket_manager import connect, disconnect
+from utils.websocket_manager import ws_manager
+from memory.agent_memory import AgentMemory
+from utils.translator import get_all_languages
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -141,6 +143,16 @@ async def startup_event() -> None:
         logger.warning("Continuing startup so the rest of the project can run")
 
 
+@app.get("/", tags=["health"])
+async def root_health() -> Dict[str, Any]:
+    """Return a lightweight welcome and health check response at the API root."""
+    return {
+        "status": "ok",
+        "service": "Multi-Agent Research Assistant API",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
 @app.get("/healthz", tags=["health"])
 async def health_check() -> Dict[str, Any]:
     """Return a lightweight health check response for uptime monitoring."""
@@ -190,6 +202,22 @@ async def health_tavily() -> Dict[str, Any]:
             "test_search_results": 0,
             "message": f"Tavily search connection error: {exc}"
         }
+
+
+@app.get("/api/health/websocket", tags=["health"])
+async def health_websocket() -> Dict[str, Any]:
+    """Return WebSocket manager status and active connection count."""
+    return {
+        "status": "healthy",
+        "active_connections": ws_manager.get_connected_count(),
+        "message": "WebSocket manager running"
+    }
+
+
+@app.get("/api/languages", tags=["localization"])
+async def get_languages() -> List[Dict[str, str]]:
+    """Return list of all supported languages for report translation."""
+    return get_all_languages()
 
 
 @app.get("/api/health/all", tags=["health"])
@@ -379,28 +407,25 @@ async def export_pdf(
 
 
 @app.websocket("/ws/research/{report_id}")
-async def research_websocket(websocket: WebSocket, report_id: str) -> None:
-    """Stream placeholder live updates for a specific report id."""
+async def websocket_endpoint(websocket: WebSocket, report_id: str) -> None:
+    """Stream live updates for a specific report id using the WebSocket manager."""
     token = websocket.query_params.get("token")
-    if not token:
-        await websocket.close(code=4401)
-        return
+    if token:
+        try:
+            from firebase_admin import auth as firebase_auth
+            firebase_auth.verify_id_token(token)
+        except Exception:
+            await websocket.close(code=4401)
+            return
 
-    try:
-        from firebase_admin import auth as firebase_auth
-
-        firebase_auth.verify_id_token(token)
-    except Exception:
-        await websocket.close(code=4401)
-        return
-
-    await connect(report_id, websocket)
+    await ws_manager.connect(websocket, report_id)
     try:
         while True:
-            message = await websocket.receive_text()
-            await websocket.send_json(WebSocketMessage(event="echo", report_id=report_id, message=message).dict())
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
     except WebSocketDisconnect:
-        await disconnect(report_id, websocket)
+        await ws_manager.disconnect(report_id)
 
 
 # Placeholder agent routes keep the endpoint structure ready for the Day 5 orchestration layer.
