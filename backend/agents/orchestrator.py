@@ -369,10 +369,22 @@ async def run_pipeline(
             await ws_manager.emit_error(report_id, "orchestrator", "Failed to generate plan.")
             return state
 
-        # -- STEP 2: SEARCH AGENT (Day 9) --
-        # state.set_current_agent("search_agent")
-        # from agents.search_agent import run as search_run
-        # await search_run(state, report_id)
+        # -- STEP 2: SEARCH AGENT --
+        from agents.search_agent import run as search_run
+        search_success = await search_run(state, report_id)
+
+        if not search_success:
+            logger.error("Search agent failed, stopping pipeline")
+            return state
+
+        search_results = state.get_field("search_results")
+        total_sources = sum(
+            r.get("source_count", 0)
+            for r in search_results
+        )
+        logger.info(
+            f"Search complete: {total_sources} sources found"
+        )
 
         # -- STEP 3: SUMMARY AGENT (Day 10-11) --
         # state.set_current_agent("summary_agent")
