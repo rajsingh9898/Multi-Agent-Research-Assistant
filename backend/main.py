@@ -25,11 +25,12 @@ from tools.confidence import calculate_confidence_score, get_confidence_label
 from tools.credibility import calculate_average_credibility, rate_source_credibility
 from tools.pinecone_tool import get_index_stats, get_openai_client, get_pinecone_client
 from tools.tavily_tool import search
+import asyncio
 from utils.auth import save_user_to_firestore, verify_token
-from utils.firebase_config import initialize_firebase
+from utils.firebase_config import initialize_firebase, get_firestore
 from utils.websocket_manager import ws_manager
 from memory.agent_memory import AgentMemory
-from utils.translator import get_all_languages
+from utils.translator import get_all_languages, validate_language
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -317,20 +318,56 @@ async def get_me(current_user: Dict[str, Any] = Depends(verify_token)) -> AuthUs
     )
 
 
-@app.post("/api/research/start", response_model=ResearchStatusResponse, tags=["research"])
+@app.post("/api/research/start", tags=["research"])
 async def start_research(
     payload: ResearchStartRequest,
     current_user: Dict[str, Any] = Depends(verify_token),
-) -> ResearchStatusResponse:
-    """Create a new research job placeholder owned by the authenticated user."""
-    report_id = f"rpt_{uuid4().hex[:12]}"
-    now = datetime.now(timezone.utc).isoformat()
+) -> Dict[str, Any]:
+    """Create a new research job, persist it in Firestore, and start it in the background."""
+    # 1. Validate request
+    topic = payload.topic.strip() if payload.topic else ""
+    if not topic:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Topic cannot be empty")
+    if len(topic) >= 500:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Topic cannot exceed 500 characters")
+    
+    depth = payload.depth.strip().lower() if payload.depth else ""
+    if depth not in {"quick", "deep", "expert"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid depth. Must be quick, deep, or expert")
+    
+    language = validate_language(payload.language)
+    if payload.language and payload.language.strip().lower() != language:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsupported language: {payload.language}")
+
+    # 2. Generate report_id
+    import uuid
+    report_id = str(uuid.uuid4())[:8]
+
+    # 3. Create initial Firestore document
+    try:
+        db = get_firestore()
+        db.collection("reports").document(report_id).set({
+            "userId": current_user["uid"],
+            "topic": topic,
+            "depth": depth,
+            "language": language,
+            "status": "pending",
+            "createdAt": datetime.utcnow(),
+            "reportData": {},
+            "confidenceScore": 0,
+            "pdfUrl": None
+        })
+    except Exception as exc:
+        logger.warning(f"Failed to save initial report {report_id} to Firestore: {exc}")
+
+    # Populate in-memory store for backward compatibility
+    now_str = datetime.now(timezone.utc).isoformat()
     REPORT_STORE[report_id] = {
         "report_id": report_id,
         "user_id": current_user["uid"],
-        "topic": payload.topic,
-        "depth": payload.depth,
-        "language": payload.language,
+        "topic": topic,
+        "depth": depth,
+        "language": language,
         "status": "pending",
         "current_agent": "orchestrator",
         "progress": 0,
@@ -339,10 +376,47 @@ async def start_research(
         "thinking_logs": [],
         "followup_questions": [],
         "report_markdown": "",
-        "created_at": now,
+        "created_at": now_str,
         "completed_at": None,
     }
-    return ResearchStatusResponse(report_id=report_id, status="pending", current_agent="orchestrator", progress=0)
+
+    # 4. Start pipeline in background
+    from agents.orchestrator import start_research as agent_start_research
+
+    async def run_in_background() -> None:
+        try:
+            # Execute orchestration pipeline
+            final_mem = await agent_start_research(
+                report_id=report_id,
+                topic=topic,
+                depth=depth,
+                language=language,
+                user_id=current_user["uid"]
+            )
+            # Sync final state back to in-memory store
+            if final_mem:
+                REPORT_STORE[report_id].update({
+                    "status": final_mem.get_field("status"),
+                    "current_agent": final_mem.get_field("current_agent"),
+                    "confidence_score": final_mem.get_field("confidence_score"),
+                    "thinking_logs": final_mem.get_field("thinking_logs"),
+                    "followup_questions": final_mem.get_field("followup_questions"),
+                    "report_markdown": final_mem.get_field("final_report").get("report_markdown", "") if isinstance(final_mem.get_field("final_report"), dict) else "",
+                    "completed_at": datetime.now(timezone.utc).isoformat() if final_mem.get_field("status") == "done" else None
+                })
+        except Exception as bg_exc:
+            logger.exception(f"Error in background task run_in_background for report {report_id}: {bg_exc}")
+
+    asyncio.create_task(run_in_background())
+
+    # 5. Return immediately
+    return {
+        "success": True,
+        "report_id": report_id,
+        "topic": topic,
+        "message": "Research started",
+        "websocket_url": f"/ws/research/{report_id}"
+    }
 
 
 @app.get("/api/research/{report_id}", response_model=ReportDataResponse, tags=["research"])
