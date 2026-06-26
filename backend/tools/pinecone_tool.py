@@ -339,7 +339,9 @@ def upsert_source_chunks(
             "credibility_emoji": _metadata_value(credibility_payload.get("emoji")),
         }
         vector_id = _build_vector_id(report_id, source_index, chunk_index, chunk)
-        vectors.append((vector_id, embedding, {key: _metadata_value(value) for key, value in metadata.items()}))
+        cleaned_metadata = {k: _metadata_value(v) for k, v in metadata.items()}
+        cleaned_metadata = {k: v for k, v in cleaned_metadata.items() if v is not None}
+        vectors.append((vector_id, embedding, cleaned_metadata))
 
     if not vectors:
         return 0

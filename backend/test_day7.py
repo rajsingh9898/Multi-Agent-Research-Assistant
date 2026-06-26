@@ -284,14 +284,10 @@ def main() -> None:
     for k, v in sim_stats.items():
         print(f"  {k}: {v}")
     print("--------------------------------")
-    
     print("✅ Test 14: Pipeline simulation PASSED")
-
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("✅ ALL 14 TESTS PASSED")
     print("Day 7 complete. Ready for Day 8.")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-
 if __name__ == "__main__":
     main()

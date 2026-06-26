@@ -57,6 +57,8 @@ class AgentMemory:
             "current_agent": None,
             "logs": [],
             "error": None,
+            "chunk_stats": {},
+            "pinecone_ready": False,
         }
 
     def update_state(self, key: str, value: Any) -> bool:
@@ -101,6 +103,8 @@ class AgentMemory:
             self._state["current_agent"] = None
             self._state["logs"] = []
             self._state["error"] = None
+            self._state["chunk_stats"] = {}
+            self._state["pinecone_ready"] = False
 
     def add_log(self, agent: str, status: str, message: str) -> None:
         """Append an execution log entry and print to standard output."""
