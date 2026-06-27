@@ -386,18 +386,18 @@ async def run_pipeline(
             f"Search complete: {total_sources} sources found"
         )
 
-        # -- STEP 3A: SUMMARY AGENT PART 1 --
-        # (Part 2 added Day 11)
+        # -- STEP 3: SUMMARY AGENT (Full) --
         state.set_current_agent("summary_agent")
-        from agents.summary_agent import embed_and_store
-        embed_result = await embed_and_store(state, report_id)
+        from agents.summary_agent import run as summary_run
+        summary_success = await summary_run(state, report_id)
 
-        if not embed_result["success"]:
-            logger.error("Summary Agent Part 1 failed")
+        if not summary_success:
+            logger.error("Summary Agent failed, stopping pipeline")
             return state
 
+        summaries = state.get_field("summaries")
         logger.info(
-            f"Stored {embed_result['total_chunks']} chunks in Pinecone"
+            f"Summary complete: {len(summaries)} summaries generated"
         )
 
         # -- STEP 4: FACTCHECK AGENT (Day 12) --
