@@ -400,10 +400,20 @@ async def run_pipeline(
             f"Summary complete: {len(summaries)} summaries generated"
         )
 
-        # -- STEP 4: FACTCHECK AGENT (Day 12) --
-        # state.set_current_agent("factcheck_agent")
-        # from agents.factcheck_agent import run as fc_run
-        # await fc_run(state, report_id)
+        # -- STEP 4: FACTCHECK AGENT --
+        state.set_current_agent("factcheck_agent")
+        from agents.factcheck_agent import run as fc_run
+        fc_success = await fc_run(state, report_id)
+
+        if not fc_success:
+            logger.error("FactCheck Agent failed, stopping pipeline")
+            return state
+
+        verified = state.get_field("verified_claims", [])
+        confidence = state.get_field("confidence_score", 0)
+        logger.info(
+            f"FactCheck complete: {len(verified)} claims, confidence: {confidence}%"
+        )
 
         # -- STEP 5: WRITER AGENT (Day 13) --
         # state.set_current_agent("writer_agent")
