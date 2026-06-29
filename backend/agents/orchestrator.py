@@ -415,29 +415,63 @@ async def run_pipeline(
             f"FactCheck complete: {len(verified)} claims, confidence: {confidence}%"
         )
 
-        # -- STEP 5: WRITER AGENT (Day 13) --
-        # state.set_current_agent("writer_agent")
-        # from agents.writer_agent import run as writer_run
-        # await writer_run(state, report_id)
+        # ── STEP 5: WRITER AGENT ──
+        state.set_current_agent("writer_agent")
+        from agents.writer_agent import \
+            write_report as writer_run
+        writer_success = await writer_run(
+            state, report_id
+        )
 
-        # -- STEP 6: FOLLOWUP AGENT (Day 13) --
-        # state.set_current_agent("followup_agent")
-        # from agents.followup_agent import run as fu_run
-        # await fu_run(state, report_id)
+        if not writer_success:
+            logger.error("Writer Agent failed")
+            return state
 
-        # -- STEP 7: CONFIDENCE SCORE --
-        # score = calculate_confidence_score(state.get_state())
-        # state.update_state("confidence_score", score)
+        report = state.get_field("final_report")
+        logger.info(
+            f"Report written: "
+            f"{report.get('word_count',0)} words"
+        )
 
-        # -- STEP 8: SAVE + COMPLETE --
+        # ── STEP 6: FOLLOWUP AGENT ──
+        state.set_current_agent("followup_agent")
+        from agents.followup_agent import \
+            run as followup_run
+        await followup_run(state, report_id)
+
+        followup = state.get_field(
+            "followup_questions", []
+        )
+        logger.info(
+            f"Follow-up questions: {len(followup)}"
+        )
+
+        # ── STEP 7: FINAL CONFIDENCE SCORE ──
+        from tools.confidence import \
+            calculate_confidence_score
+        final_confidence = calculate_confidence_score(
+            state.get_state()
+        )
+        state.update_state(
+            "confidence_score", final_confidence
+        )
+        logger.info(
+            f"Final confidence: {final_confidence}%"
+        )
+
+        # ── STEP 8: SAVE TO FIRESTORE ──
         state.set_status("done")
-        state.add_log("system", "done", "Research pipeline complete")
-
-        # Save results to database
+        state.add_log("system", "done",
+            "Research pipeline complete")
         state.save_to_firestore()
 
-        # Alert listeners report is ready
+        # ── STEP 9: NOTIFY FRONTEND ──
         await ws_manager.emit_report_ready(report_id)
+
+        logger.info(
+            f"Pipeline complete for: "
+            f"{state.get_field('topic')}"
+        )
 
         return state
 
