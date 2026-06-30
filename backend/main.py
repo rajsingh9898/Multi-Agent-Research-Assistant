@@ -470,14 +470,112 @@ async def delete_report(
 async def export_pdf(
     payload: PDFExportRequest,
     current_user: Dict[str, Any] = Depends(verify_token),
-) -> Dict[str, str]:
-    """Return a placeholder PDF URL for the authenticated user's report."""
-    report = REPORT_STORE.get(payload.report_id)
-    if not report:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
-    if report["user_id"] != current_user["uid"]:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to export this report")
-    return {"pdf_url": f"/tmp/{payload.report_id}.pdf"}
+) -> Dict[str, Any]:
+    """Generates PDF from a completed report and uploads to Firebase Storage."""
+    try:
+        report_data = None
+        topic = ""
+        report_id = payload.report_id
+
+        # 1. Try fetching from Firestore first
+        try:
+            db = get_firestore()
+            doc_ref = db.collection("reports").document(report_id)
+            doc = doc_ref.get()
+            if doc.exists:
+                data = doc.to_dict()
+                if data.get("userId") != current_user["uid"]:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Not authorized to access this report"
+                    )
+                report_data = data.get("reportData", {})
+                topic = data.get("topic", "")
+        except HTTPException:
+            raise
+        except Exception as fe:
+            logger.warning("Firestore lookup failed, falling back to local REPORT_STORE: %s", fe)
+
+        # 2. Local fallback for testing/offline environments
+        if not report_data:
+            local_report = REPORT_STORE.get(report_id)
+            if not local_report:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Report not found"
+                )
+            if local_report.get("user_id") != current_user["uid"]:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to access this report"
+                )
+            topic = local_report.get("topic", "")
+            report_data = local_report.get("final_report") or local_report
+
+        if not report_data or (isinstance(report_data, dict) and not report_data.get("executive_summary")):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Report not yet complete"
+            )
+
+        from tools.pdf_export import generate_and_upload_pdf
+
+        # 3. Generate and upload PDF
+        result = generate_and_upload_pdf(
+            report=report_data,
+            topic=topic,
+            report_id=report_id
+        )
+
+        if not result["success"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"PDF generation failed: {result.get('error')}"
+            )
+
+        # 4. Save URL back to Firestore
+        try:
+            db = get_firestore()
+            db.collection("reports").document(report_id).update({
+                "pdfUrl": result["pdf_url"]
+            })
+        except Exception as fe:
+            logger.warning("Could not update pdfUrl in Firestore: %s", fe)
+
+        # Update in-memory store
+        if report_id in REPORT_STORE:
+            REPORT_STORE[report_id]["pdf_url"] = result["pdf_url"]
+
+        return {
+            "success": True,
+            "pdf_url": result["pdf_url"]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("PDF export endpoint error")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.get("/api/health/pdf", tags=["health"])
+async def pdf_health() -> Dict[str, Any]:
+    """Return Devanagari Unicode PDF font registration status."""
+    try:
+        from tools.pdf_export import register_fonts
+        unicode_ok = register_fonts()
+        return {
+            "status": "healthy",
+            "unicode_font_available": unicode_ok
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e)
+        }
 
 
 @app.websocket("/ws/research/{report_id}")
