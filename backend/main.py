@@ -1,474 +1,796 @@
 """FastAPI application entry point for Multi-Agent Research Assistant.
 
-This module wires together:
-- Firebase initialization on startup
-- Firebase auth login and user profile persistence
-- Protected API endpoints for research/report workflows
-- WebSocket placeholder endpoint for live agent updates
-- OpenAPI metadata and health checks
+This module coordinates authentications, background orchestration tasks,
+multilingual document generations, health metrics, and WebSockets.
 """
 
 from __future__ import annotations
 
-import logging
 import os
+import uuid
+import logging
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    FastAPI, WebSocket, HTTPException,
+    Depends, BackgroundTasks,
+    WebSocketDisconnect, status
+)
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, validator
 
-from tools.confidence import calculate_confidence_score, get_confidence_label
-from tools.credibility import calculate_average_credibility, rate_source_credibility
-from tools.pinecone_tool import get_index_stats, get_openai_client, get_pinecone_client
-from tools.tavily_tool import search
-import asyncio
-from utils.auth import save_user_to_firestore, verify_token
-from utils.firebase_config import initialize_firebase, get_firestore
-from utils.websocket_manager import ws_manager
-from memory.agent_memory import AgentMemory
-from utils.translator import get_all_languages, validate_language
-
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
-
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+load_dotenv()
 logger = logging.getLogger(__name__)
 
-API_TITLE = "Multi-Agent Research Assistant"
-API_VERSION = "1.0.0"
-API_DESCRIPTION = "FastAPI backend for a multi-agent research assistant with Firebase auth, reports, and live updates."
-
-app = FastAPI(
-    title=API_TITLE,
-    version=API_VERSION,
-    description=API_DESCRIPTION,
-    docs_url="/docs",
-    redoc_url="/redoc",
+# Initialize Firebase FIRST (before routes)
+from utils.firebase_config import (
+    initialize_firebase, get_firestore,
+    get_storage
 )
 
-# CORS is intentionally broad in development and should be narrowed in production.
-allowed_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+firebase_initialized = False
+try:
+    initialize_firebase()
+    firebase_initialized = True
+    logger.info("Firebase Admin successfully initialized on startup.")
+except Exception as exc:
+    logger.warning("Firebase Admin initialization failed on startup: %s. Proceeding in offline mode.", exc)
+
+# Import auth
+from utils.auth import (
+    verify_token, save_user_to_firestore
+)
+
+# Import WebSocket manager
+from utils.websocket_manager import ws_manager
+
+# App Setup
+app = FastAPI(
+    title="Multi-Agent Research Assistant API",
+    description="AI research pipeline with 6 agents",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# CORS Mappings
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000"
+]
+if FRONTEND_URL:
+    ALLOWED_ORIGINS.append(FRONTEND_URL)
+
+# Add Vercel wildcard matching standard specs
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in allowed_origins if origin.strip()],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex="https://.*\\.vercel\\.app",
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
-
-class AuthLoginRequest(BaseModel):
-    """Request body for Firebase login exchange."""
-
-    id_token: str = Field(..., description="Firebase ID token returned by the client SDK")
+# In-memory storage fallback keeps starter test suites functional when Firestore is offline.
+REPORT_STORE: Dict[str, Dict[str, Any]] = {}
 
 
-class AuthUserResponse(BaseModel):
-    """Normalized authenticated user payload returned by the backend."""
+# --- PYDANTIC SCHEMAS ---
 
-    uid: str
-    email: Optional[str] = None
-    display_name: Optional[str] = None
-    photo_url: Optional[str] = None
-    email_verified: bool = False
-    created_at: Optional[str] = None
-    last_login_at: Optional[str] = None
+class ResearchRequest(BaseModel):
+    """Payload to trigger new research run."""
+    topic: str
+    depth: str = "deep"
+    language: str = "english"
+
+    @validator("topic")
+    def topic_not_empty(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Topic cannot be empty")
+        if len(v) > 500:
+            raise ValueError("Topic too long (max 500 chars)")
+        return v
+
+    @validator("depth")
+    def depth_valid(cls, v):
+        allowed = ["quick", "deep", "expert"]
+        v = v.strip().lower()
+        if v not in allowed:
+            raise ValueError(f"Depth must be one of {allowed}")
+        return v
+
+    @validator("language")
+    def language_valid(cls, v):
+        from utils.translator import validate_language
+        return validate_language(v)
 
 
-class ResearchStartRequest(BaseModel):
-    """Request body to start a new research run."""
-
-    topic: str = Field(..., min_length=2)
-    depth: str = Field("deep", description="quick | deep | expert")
-    language: str = Field("english", description="english | hindi | spanish")
+class LoginRequest(BaseModel):
+    """User authentication payload containing client-side ID Token."""
+    token: str
 
 
-class ResearchStatusResponse(BaseModel):
-    """Response returned when a research run is created or queried."""
-
+class ExportPdfRequest(BaseModel):
+    """Request to export report to printable PDF."""
     report_id: str
+
+
+class ResearchStartResponse(BaseModel):
+    """Synchronous creation response."""
+    success: bool
+    report_id: str
+    topic: str
     status: str
-    current_agent: Optional[str] = None
-    progress: int = 0
+    websocket_url: str
+    message: str
 
 
-class ReportDataResponse(BaseModel):
-    """Stored report data returned from the API."""
-
+class ReportResponse(BaseModel):
+    """Detailed report payload metadata."""
     report_id: str
-    user_id: str
     topic: str
     depth: str
     language: str
     status: str
-    confidence_score: int = 0
-    source_credibility: List[Dict[str, Any]] = Field(default_factory=list)
-    thinking_logs: List[Dict[str, Any]] = Field(default_factory=list)
-    followup_questions: List[str] = Field(default_factory=list)
-    report_markdown: str = ""
-    created_at: str
+    created_at: Optional[str] = None
     completed_at: Optional[str] = None
+    report_data: Optional[Dict[str, Any]] = None
+    confidence_score: int
+    pdf_url: Optional[str] = None
+    followup_questions: Optional[List[str]] = None
+    error: Optional[str] = None
 
 
-class PDFExportRequest(BaseModel):
-    """Request body for generating a PDF from a report."""
-
+class HistoryItem(BaseModel):
+    """Summary of a past report for history dashboard."""
     report_id: str
+    topic: str
+    status: str
+    created_at: Optional[str] = None
+    confidence_score: int
+    pdf_url: Optional[str] = None
+    word_count: Optional[int] = None
+    depth: str = "deep"
+    language: str = "english"
 
 
-class WebSocketMessage(BaseModel):
-    """Simple schema for placeholder WebSocket events."""
+# --- HELPERS ---
 
-    event: str
-    agent: Optional[str] = None
-    message: Optional[str] = None
-    thought: Optional[str] = None
-    report_id: Optional[str] = None
+def generate_report_id() -> str:
+    """Returns a short unique ID (first 8 chars of UUID)."""
+    return str(uuid.uuid4())[:8]
 
 
-# In-memory storage keeps the starter project runnable before Firestore wiring is complete.
-REPORT_STORE: Dict[str, Dict[str, Any]] = {}
-
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    """Initialize Firebase once when the application starts."""
+def format_timestamp(ts: Any) -> Optional[str]:
+    """Safely converts Firestore datetime types to ISO format string."""
+    if ts is None:
+        return None
+    if isinstance(ts, str):
+        return ts
     try:
-        initialize_firebase()
-        logger.info("Firebase initialization completed")
-    except Exception as exc:
-        logger.warning("Firebase initialization failed during startup: %s", exc)
-        logger.warning("Continuing startup so the rest of the project can run")
+        return ts.isoformat()
+    except Exception:
+        return str(ts)
 
+
+def firestore_doc_to_response(doc_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Converts a database doc dictionary to match the ReportResponse structure."""
+    return {
+        "report_id": doc_id,
+        "topic": data.get("topic", ""),
+        "depth": data.get("depth", "deep"),
+        "language": data.get("language", "english"),
+        "status": data.get("status", "pending"),
+        "created_at": format_timestamp(data.get("createdAt")),
+        "completed_at": format_timestamp(data.get("completedAt")),
+        "report_data": data.get("reportData", {}),
+        "confidence_score": data.get("confidenceScore", 0),
+        "pdf_url": data.get("pdfUrl"),
+        "followup_questions": data.get("followupQuestions", []),
+        "error": data.get("error")
+    }
+
+
+# --- BACKGROUND COORDINATOR ---
+
+async def run_pipeline_background(
+    report_id: str,
+    topic: str,
+    depth: str,
+    language: str,
+    user_id: str
+) -> None:
+    """Executes the complete orchestration pipeline in the background.
+
+    Defensively catches all exceptions to prevent task crashes and updates Firestore.
+    """
+    try:
+        logger.info(f"Background pipeline starting: {report_id}")
+
+        # 1. Update status to running
+        try:
+            db = get_firestore()
+            db.collection("reports").document(report_id).update({"status": "running"})
+        except Exception as fe:
+            logger.warning("Could not set status to running in Firestore: %s", fe)
+
+        # Update local store for offline fallbacks
+        if report_id in REPORT_STORE:
+            REPORT_STORE[report_id]["status"] = "running"
+            REPORT_STORE[report_id]["current_agent"] = "orchestrator"
+
+        # 2. Run the complete pipeline
+        from agents.orchestrator import start_research
+        final_state = await start_research(
+            report_id=report_id,
+            topic=topic,
+            depth=depth,
+            language=language,
+            user_id=user_id
+        )
+
+        # 3. Retrieve final metrics
+        final_report = final_state.get_field("final_report", {}) or {}
+        confidence = final_state.get_field("confidence_score", 0)
+        followup = final_state.get_field("followup_questions", []) or []
+        status_val = final_state.get_field("status", "done")
+        error_msg = final_state.get_field("error")
+
+        # 4. Save results back to Firestore
+        update_data = {
+            "status": status_val,
+            "reportData": final_report,
+            "confidenceScore": confidence,
+            "followupQuestions": followup
+        }
+        if status_val == "done":
+            update_data["completedAt"] = datetime.now(timezone.utc)
+        if error_msg:
+            update_data["error"] = error_msg
+
+        try:
+            db = get_firestore()
+            db.collection("reports").document(report_id).update(update_data)
+        except Exception as fe:
+            logger.warning("Could not save final research fields to Firestore: %s", fe)
+
+        # Sync local store fallback
+        if report_id in REPORT_STORE:
+            REPORT_STORE[report_id].update({
+                "status": status_val,
+                "current_agent": final_state.get_field("current_agent"),
+                "confidence_score": confidence,
+                "thinking_logs": final_state.get_field("thinking_logs") or [],
+                "followup_questions": followup,
+                "report_data": final_report,
+                "report_markdown": final_report.get("executive_summary", "") if isinstance(final_report, dict) else "",
+                "completed_at": datetime.now(timezone.utc).isoformat() if status_val == "done" else None,
+                "error": error_msg
+            })
+
+        logger.info(f"Pipeline complete for report {report_id}: status={status_val}")
+
+    except Exception as exc:
+        error_msg = str(exc)
+        logger.error(f"Background research pipeline failed for report {report_id}: {error_msg}", exc_info=True)
+
+        # Record failure in Firestore
+        try:
+            db = get_firestore()
+            db.collection("reports").document(report_id).update({
+                "status": "failed",
+                "error": error_msg
+            })
+        except Exception as fe:
+            logger.error("Could not record pipeline failure in Firestore: %s", fe)
+
+        # Record failure locally
+        if report_id in REPORT_STORE:
+            REPORT_STORE[report_id].update({
+                "status": "failed",
+                "error": error_msg
+            })
+
+        # Alert listeners
+        try:
+            await ws_manager.emit_error(report_id, "system", f"Pipeline failed: {error_msg}")
+        except Exception as ws_err:
+            logger.warning("Could not emit background error event over WebSockets: %s", ws_err)
+
+
+# --- ROUTE ENDPOINTS ---
 
 @app.get("/", tags=["health"])
 async def root_health() -> Dict[str, Any]:
-    """Return a lightweight welcome and health check response at the API root."""
+    """Lightweight welcome and routing layout health check."""
     return {
-        "status": "ok",
-        "service": "Multi-Agent Research Assistant API",
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-
-
-@app.get("/healthz", tags=["health"])
-async def health_check() -> Dict[str, Any]:
-    """Return a lightweight health check response for uptime monitoring."""
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
-
-
-@app.get("/api/health/pinecone", tags=["health"])
-async def health_pinecone() -> Dict[str, Any]:
-    """Return Pinecone index health and readiness information."""
-    stats = get_index_stats()
-    return {
-        "service": "pinecone",
-        "status": stats.get("status", "unknown"),
-        "ready": stats.get("status") not in {"error", "unknown"},
-        "stats": stats,
-    }
-
-
-@app.get("/api/health/tavily", tags=["health"])
-async def health_tavily() -> Dict[str, Any]:
-    """Return Tavily Search API health and connectivity status."""
-    api_key = os.getenv("TAVILY_API_KEY")
-    api_key_configured = bool(api_key and api_key.strip())
-
-    if not api_key_configured:
-        return {
-            "status": "error",
-            "api_key_configured": False,
-            "test_search_results": 0,
-            "message": "TAVILY_API_KEY is not configured in .env file."
+        "status": "running",
+        "project": "Multi-Agent Research Assistant",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "endpoints": {
+            "research": "POST /api/research/start",
+            "status": "GET /api/research/{id}",
+            "history": "GET /api/reports/history",
+            "pdf": "POST /api/export/pdf",
+            "websocket": "WS /ws/research/{id}"
         }
-
-    try:
-        # Execute a test search query to verify Tavily connectivity
-        results = search(query="test query", max_results=1, search_depth="basic")
-        return {
-            "status": "healthy",
-            "api_key_configured": True,
-            "test_search_results": len(results),
-            "message": "Tavily search tool is online and fully configured."
-        }
-    except Exception as exc:
-        logger.exception("Tavily health check search failed")
-        return {
-            "status": "error",
-            "api_key_configured": True,
-            "test_search_results": 0,
-            "message": f"Tavily search connection error: {exc}"
-        }
-
-
-@app.get("/api/health/websocket", tags=["health"])
-async def health_websocket() -> Dict[str, Any]:
-    """Return WebSocket manager status and active connection count."""
-    return {
-        "status": "healthy",
-        "active_connections": ws_manager.get_connected_count(),
-        "message": "WebSocket manager running"
     }
-
-
-@app.get("/api/languages", tags=["localization"])
-async def get_languages() -> List[Dict[str, str]]:
-    """Return list of all supported languages for report translation."""
-    return get_all_languages()
 
 
 @app.get("/api/health/all", tags=["health"])
 async def health_all() -> Dict[str, Any]:
-    """Return a consolidated status payload for all configured services."""
+    """Consolidated connectivity check of all third-party services."""
     services: Dict[str, Dict[str, Any]] = {}
+    is_firebase_ok = True
 
+    # 1. Pinecone
     try:
-        initialize_firebase()
-        services["firebase"] = {"status": "ready", "message": "Firebase initialized"}
+        from tools.pinecone_tool import get_index_stats
+        stats = get_index_stats()
+        services["pinecone"] = {
+            "status": "healthy" if stats.get("status") != "error" else "error",
+            "total_vectors": stats.get("total_vectors", 0)
+        }
     except Exception as exc:
-        services["firebase"] = {"status": "error", "message": str(exc)}
+        services["pinecone"] = {"status": "error", "message": str(exc)}
 
+    # 2. Tavily
     try:
-        get_openai_client()
-        services["openai"] = {"status": "ready", "message": "OpenAI client initialized"}
+        from tools.tavily_tool import initialize_tavily
+        client = initialize_tavily()
+        services["tavily"] = {"status": "healthy" if client else "error"}
     except Exception as exc:
-        services["openai"] = {"status": "error", "message": str(exc)}
+        services["tavily"] = {"status": "error", "message": str(exc)}
 
-    try:
-        get_pinecone_client()
-        services["pinecone"] = {"status": "ready", "message": "Pinecone client initialized", "stats": get_index_stats()}
-    except Exception as exc:
-        services["pinecone"] = {"status": "error", "message": str(exc), "stats": get_index_stats()}
+    # 3. Firebase Firestore
+    if firebase_initialized:
+        try:
+            db = get_firestore()
+            # Query collection test
+            db.collection("reports").limit(1).get()
+            services["firebase"] = {"status": "healthy"}
+        except Exception as exc:
+            is_firebase_ok = False
+            services["firebase"] = {"status": "error", "message": str(exc)}
+    else:
+        is_firebase_ok = False
+        services["firebase"] = {
+            "status": "error",
+            "message": "Firebase Admin not initialized (offline fallback mode)"
+        }
 
-    tavily_api_key = os.getenv("TAVILY_API_KEY")
-    services["tavily"] = {
-        "status": "ready" if tavily_api_key else "missing",
-        "message": "Tavily API key configured" if tavily_api_key else "TAVILY_API_KEY is not set",
+    # 4. OpenAI API Key check
+    api_key = os.getenv("OPENAI_API_KEY")
+    services["openai"] = {
+        "status": "configured" if api_key and api_key.strip() else "missing"
     }
 
-    sample_sources = [
-        rate_source_credibility("https://www.nature.com/articles/d41586-024-00001-0"),
-        rate_source_credibility("https://www.reuters.com/world/"),
-    ]
-    sample_state = {
-        "source_credibility": sample_sources,
-        "verified_claims": [{"verified": True}, {"verified": False}],
+    # 5. WebSockets Manager status
+    services["websocket"] = {
+        "status": "healthy",
+        "active_connections": ws_manager.get_connected_count()
     }
+
+    # Decide consolidated status
+    if not is_firebase_ok:
+        overall = "down"
+    elif any(s["status"] == "error" for s in services.values()):
+        overall = "degraded"
+    else:
+        overall = "healthy"
 
     return {
-        "service": "all",
-        "status": "ready"
-        if all(item["status"] == "ready" for item in services.values())
-        else "degraded",
+        "status": overall,
         "services": services,
-        "confidence_example": {
-            "score": calculate_confidence_score(sample_state),
-            "label": get_confidence_label(calculate_confidence_score(sample_state)),
-            "average_credibility": calculate_average_credibility(sample_sources),
-        },
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 
-@app.post("/api/auth/login", response_model=AuthUserResponse, tags=["auth"])
-async def login_user(payload: AuthLoginRequest) -> AuthUserResponse:
-    """Verify a Firebase ID token and create/update the corresponding user profile."""
-    # Reuse the dependency logic by passing the bearer token into verify_token.
+@app.get("/api/health/pinecone", tags=["health"])
+async def health_pinecone() -> Dict[str, Any]:
+    """Return Pinecone index stats and connection metrics."""
+    try:
+        from tools.pinecone_tool import get_index_stats
+        stats = get_index_stats()
+        return {
+            "service": "pinecone",
+            "status": "healthy" if stats.get("status") != "error" else "error",
+            "stats": stats
+        }
+    except Exception as exc:
+        return {"service": "pinecone", "status": "error", "message": str(exc)}
+
+
+@app.get("/api/health/tavily", tags=["health"])
+async def health_tavily() -> Dict[str, Any]:
+    """Return Tavily Search API connectivity status."""
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return {"service": "tavily", "status": "error", "message": "TAVILY_API_KEY is not configured"}
+    try:
+        from tools.tavily_tool import search
+        results = search("test query", max_results=1)
+        return {"service": "tavily", "status": "healthy", "results_count": len(results)}
+    except Exception as exc:
+        return {"service": "tavily", "status": "error", "message": str(exc)}
+
+
+@app.get("/api/health/websocket", tags=["health"])
+async def health_websocket() -> Dict[str, Any]:
+    """Return active connection counts inside WebSocketManager."""
+    return {
+        "status": "healthy",
+        "active_connections": ws_manager.get_connected_count()
+    }
+
+
+@app.get("/api/languages", tags=["localization"])
+async def get_languages() -> Dict[str, Any]:
+    """Return configured translator language details."""
+    from utils.translator import get_all_languages
+    return {
+        "languages": get_all_languages(),
+        "default": "english"
+    }
+
+
+@app.post("/api/auth/login", tags=["auth"])
+async def login_user(payload: LoginRequest) -> Dict[str, Any]:
+    """Verify bearer token credentials with Firebase Admin and register user document."""
     try:
         from firebase_admin import auth as firebase_auth
-
-        decoded = firebase_auth.verify_id_token(payload.id_token)
+        decoded = firebase_auth.verify_id_token(payload.token)
         user = {
             "uid": decoded.get("uid"),
             "email": decoded.get("email"),
-            "name": decoded.get("name"),
+            "name": decoded.get("name") or decoded.get("email", "").split("@")[0],
             "picture": decoded.get("picture"),
             "email_verified": decoded.get("email_verified", False),
         }
         saved_user = save_user_to_firestore(user)
-        return AuthUserResponse(
-            uid=saved_user["uid"],
-            email=saved_user.get("email"),
-            display_name=saved_user.get("displayName"),
-            photo_url=saved_user.get("photoURL"),
-            email_verified=bool(saved_user.get("emailVerified", False)),
-            created_at=saved_user.get("createdAtClient"),
-            last_login_at=datetime.now(timezone.utc).isoformat(),
-        )
-    except HTTPException:
-        raise
+        return {
+            "success": True,
+            "user": {
+                "uid": saved_user["uid"],
+                "email": saved_user.get("email"),
+                "name": saved_user.get("displayName"),
+                "picture": saved_user.get("photoURL"),
+            },
+            "message": "Login successful"
+        }
     except Exception as exc:
-        logger.exception("Login failed")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unable to verify Firebase token") from exc
+        logger.warning("Token verification failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unable to verify Firebase auth token"
+        )
 
 
-@app.get("/api/auth/me", response_model=AuthUserResponse, tags=["auth"])
-async def get_me(current_user: Dict[str, Any] = Depends(verify_token)) -> AuthUserResponse:
-    """Return the current authenticated user from the Firebase token."""
-    return AuthUserResponse(
-        uid=current_user["uid"],
-        email=current_user.get("email"),
-        display_name=current_user.get("name"),
-        photo_url=current_user.get("picture"),
-        email_verified=bool(current_user.get("email_verified", False)),
-    )
+@app.get("/api/auth/me", tags=["auth"])
+async def get_me(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
+    """Retrieves validated token credentials representing active user profile."""
+    return {
+        "uid": current_user["uid"],
+        "email": current_user.get("email"),
+        "name": current_user.get("name"),
+        "picture": current_user.get("picture")
+    }
 
 
-@app.post("/api/research/start", tags=["research"])
+@app.post("/api/research/start", response_model=ResearchStartResponse, tags=["research"])
 async def start_research(
-    payload: ResearchStartRequest,
-    current_user: Dict[str, Any] = Depends(verify_token),
+    request: ResearchRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Dict[str, Any] = Depends(verify_token)
 ) -> Dict[str, Any]:
-    """Create a new research job, persist it in Firestore, and start it in the background."""
-    # 1. Validate request
-    topic = payload.topic.strip() if payload.topic else ""
-    if not topic:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Topic cannot be empty")
-    if len(topic) >= 500:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Topic cannot exceed 500 characters")
-    
-    depth = payload.depth.strip().lower() if payload.depth else ""
-    if depth not in {"quick", "deep", "expert"}:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid depth. Must be quick, deep, or expert")
-    
-    language = validate_language(payload.language)
-    if payload.language and payload.language.strip().lower() != language:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsupported language: {payload.language}")
+    """Synchronously creates a research document and triggers background agent tasks.
 
-    # 2. Generate report_id
-    import uuid
-    report_id = str(uuid.uuid4())[:8]
-
-    # 3. Create initial Firestore document
+    MUST return control to client in under 1 second.
+    """
     try:
-        db = get_firestore()
-        db.collection("reports").document(report_id).set({
-            "userId": current_user["uid"],
+        topic = request.topic.strip()
+        depth = request.depth
+        language = request.language
+        user_id = current_user["uid"]
+
+        report_id = generate_report_id()
+
+        # 1. Create document in Firestore
+        doc_data = {
+            "userId": user_id,
             "topic": topic,
             "depth": depth,
             "language": language,
             "status": "pending",
-            "createdAt": datetime.utcnow(),
+            "createdAt": datetime.now(timezone.utc),
+            "completedAt": None,
             "reportData": {},
             "confidenceScore": 0,
-            "pdfUrl": None
-        })
-    except Exception as exc:
-        logger.warning(f"Failed to save initial report {report_id} to Firestore: {exc}")
+            "pdfUrl": None,
+            "error": None,
+            "followupQuestions": []
+        }
 
-    # Populate in-memory store for backward compatibility
-    now_str = datetime.now(timezone.utc).isoformat()
-    REPORT_STORE[report_id] = {
-        "report_id": report_id,
-        "user_id": current_user["uid"],
-        "topic": topic,
-        "depth": depth,
-        "language": language,
-        "status": "pending",
-        "current_agent": "orchestrator",
-        "progress": 0,
-        "confidence_score": 0,
-        "source_credibility": [],
-        "thinking_logs": [],
-        "followup_questions": [],
-        "report_markdown": "",
-        "created_at": now_str,
-        "completed_at": None,
-    }
-
-    # 4. Start pipeline in background
-    from agents.orchestrator import start_research as agent_start_research
-
-    async def run_in_background() -> None:
         try:
-            # Execute orchestration pipeline
-            final_mem = await agent_start_research(
-                report_id=report_id,
-                topic=topic,
-                depth=depth,
-                language=language,
-                user_id=current_user["uid"]
-            )
-            # Sync final state back to in-memory store
-            if final_mem:
-                REPORT_STORE[report_id].update({
-                    "status": final_mem.get_field("status"),
-                    "current_agent": final_mem.get_field("current_agent"),
-                    "confidence_score": final_mem.get_field("confidence_score"),
-                    "thinking_logs": final_mem.get_field("thinking_logs"),
-                    "followup_questions": final_mem.get_field("followup_questions"),
-                    "report_markdown": final_mem.get_field("final_report").get("report_markdown", "") if isinstance(final_mem.get_field("final_report"), dict) else "",
-                    "completed_at": datetime.now(timezone.utc).isoformat() if final_mem.get_field("status") == "done" else None
-                })
-        except Exception as bg_exc:
-            logger.exception(f"Error in background task run_in_background for report {report_id}: {bg_exc}")
+            db = get_firestore()
+            db.collection("reports").document(report_id).set(doc_data)
+        except Exception as fe:
+            logger.warning("Could not set pending report in Firestore: %s", fe)
 
-    asyncio.create_task(run_in_background())
+        # 2. Store locally in memory for fallback tests
+        REPORT_STORE[report_id] = {
+            "report_id": report_id,
+            "user_id": user_id,
+            "topic": topic,
+            "depth": depth,
+            "language": language,
+            "status": "pending",
+            "current_agent": "orchestrator",
+            "progress": 0,
+            "confidence_score": 0,
+            "thinking_logs": [],
+            "followup_questions": [],
+            "report_data": {},
+            "report_markdown": "",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+            "pdf_url": None,
+            "error": None
+        }
 
-    # 5. Return immediately
-    return {
-        "success": True,
-        "report_id": report_id,
-        "topic": topic,
-        "message": "Research started",
-        "websocket_url": f"/ws/research/{report_id}"
-    }
+        # 3. Run orchestrator agents pipeline in background
+        background_tasks.add_task(
+            run_pipeline_background,
+            report_id=report_id,
+            topic=topic,
+            depth=depth,
+            language=language,
+            user_id=user_id
+        )
+
+        logger.info(f"Research pipeline successfully triggered for topic: '{topic[:40]}...' ID: {report_id}")
+
+        return {
+            "success": True,
+            "report_id": report_id,
+            "topic": topic,
+            "status": "pending",
+            "websocket_url": f"/ws/research/{report_id}",
+            "message": "Research pipeline started"
+        }
+
+    except ValueError as val_err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(val_err)
+        )
+    except Exception as exc:
+        logger.error("Failed to start research task: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to initiate research workflow"
+        )
 
 
-@app.get("/api/research/{report_id}", response_model=ReportDataResponse, tags=["research"])
+@app.get("/api/research/{report_id}", response_model=ReportResponse, tags=["research"])
 async def get_report(
     report_id: str,
-    current_user: Dict[str, Any] = Depends(verify_token),
-) -> ReportDataResponse:
-    """Return a report only if it belongs to the authenticated user."""
-    report = REPORT_STORE.get(report_id)
-    if not report:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
-    if report["user_id"] != current_user["uid"]:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this report")
-    return ReportDataResponse(**report)
+    current_user: Dict[str, Any] = Depends(verify_token)
+) -> Dict[str, Any]:
+    """Retrieves document matching ID, verifying ownership."""
+    report_data = None
 
+    # Try Firestore
+    try:
+        db = get_firestore()
+        doc = db.collection("reports").document(report_id).get()
+        if doc.exists:
+            data = doc.to_dict()
+            if data.get("userId") != current_user["uid"]:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to view this report"
+                )
+            return firestore_doc_to_response(report_id, data)
+    except HTTPException:
+        raise
+    except Exception as fe:
+        logger.warning("Firestore report fetch failed, using local store: %s", fe)
 
-@app.get("/api/reports/history", response_model=List[ResearchStatusResponse], tags=["research"])
-async def get_history(current_user: Dict[str, Any] = Depends(verify_token)) -> List[ResearchStatusResponse]:
-    """Return the current user's recent reports."""
-    history: List[ResearchStatusResponse] = []
-    for report in REPORT_STORE.values():
-        if report["user_id"] != current_user["uid"]:
-            continue
-        history.append(
-            ResearchStatusResponse(
-                report_id=report["report_id"],
-                status=report["status"],
-                current_agent=report.get("current_agent"),
-                progress=int(report.get("progress", 0)),
-            )
+    # Fallback to local store
+    local_report = REPORT_STORE.get(report_id)
+    if not local_report:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report not found"
         )
-    return history
+    if local_report.get("user_id") != current_user["uid"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to view this report"
+        )
+
+    # Map local response structure
+    return {
+        "report_id": report_id,
+        "topic": local_report.get("topic", ""),
+        "depth": local_report.get("depth", "deep"),
+        "language": local_report.get("language", "english"),
+        "status": local_report.get("status", "pending"),
+        "created_at": format_timestamp(local_report.get("created_at")),
+        "completed_at": format_timestamp(local_report.get("completed_at")),
+        "report_data": local_report.get("report_data", {}),
+        "confidence_score": local_report.get("confidence_score", 0),
+        "pdf_url": local_report.get("pdf_url"),
+        "followup_questions": local_report.get("followup_questions", []),
+        "error": local_report.get("error")
+    }
+
+
+@app.get("/api/reports/history", tags=["research"])
+async def get_history(
+    limit: int = 20,
+    current_user: Dict[str, Any] = Depends(verify_token)
+) -> Dict[str, Any]:
+    """Retrieves past research history associated with authenticated profile ID."""
+    db_history = []
+    limit = min(max(1, limit), 50)
+    is_db_success = False
+
+    # Try Firestore
+    try:
+        db = get_firestore()
+        reports_ref = db.collection("reports")\
+            .where("userId", "==", current_user["uid"])\
+            .order_by("createdAt", direction="DESCENDING")\
+            .limit(limit)
+
+        docs = reports_ref.stream()
+        for doc in docs:
+            data = doc.to_dict()
+            report_data = data.get("reportData", {})
+            db_history.append({
+                "report_id": doc.id,
+                "topic": data.get("topic", ""),
+                "status": data.get("status", "unknown"),
+                "created_at": format_timestamp(data.get("createdAt")),
+                "confidence_score": data.get("confidenceScore", 0),
+                "pdf_url": data.get("pdfUrl"),
+                "word_count": report_data.get("word_count"),
+                "depth": data.get("depth", "deep"),
+                "language": data.get("language", "english")
+            })
+        is_db_success = True
+    except Exception as fe:
+        logger.warning("Firestore query failed for report history: %s", fe)
+
+    # Fallback to local store filtering
+    if not is_db_success:
+        local_history = []
+        for rid, report in REPORT_STORE.items():
+            if report.get("user_id") == current_user["uid"]:
+                rep_data = report.get("report_data", {})
+                local_history.append({
+                    "report_id": rid,
+                    "topic": report.get("topic", ""),
+                    "status": report.get("status", "unknown"),
+                    "created_at": format_timestamp(report.get("created_at")),
+                    "confidence_score": report.get("confidence_score", 0),
+                    "pdf_url": report.get("pdf_url"),
+                    "word_count": rep_data.get("word_count"),
+                    "depth": report.get("depth", "deep"),
+                    "language": report.get("language", "english")
+                })
+        # Sort newest first
+        local_history.sort(key=lambda x: x["created_at"] or "", reverse=True)
+        db_history = local_history[:limit]
+
+    return {
+        "success": True,
+        "reports": db_history,
+        "count": len(db_history)
+    }
 
 
 @app.delete("/api/reports/{report_id}", tags=["research"])
 async def delete_report(
     report_id: str,
-    current_user: Dict[str, Any] = Depends(verify_token),
-) -> Dict[str, str]:
-    """Delete a report only if it belongs to the current user."""
-    report = REPORT_STORE.get(report_id)
-    if not report:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
-    if report["user_id"] != current_user["uid"]:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to delete this report")
-    del REPORT_STORE[report_id]
-    return {"message": "Report deleted"}
+    current_user: Dict[str, Any] = Depends(verify_token)
+) -> Dict[str, Any]:
+    """Deletes research records, executing cleanups in Pinecone and Storage."""
+    try:
+        report_data = None
+        has_firestore_doc = False
+
+        # Fetch doc first for ownership verification
+        try:
+            db = get_firestore()
+            doc_ref = db.collection("reports").document(report_id)
+            doc = doc_ref.get()
+            if doc.exists:
+                report_data = doc.to_dict()
+                has_firestore_doc = True
+                if report_data.get("userId") != current_user["uid"]:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Not authorized to delete this report"
+                    )
+        except HTTPException:
+            raise
+        except Exception as fe:
+            logger.warning("Firestore fetch failed during delete check, using local store fallback: %s", fe)
+
+        # Fallback to local store checks
+        if not report_data:
+            local_report = REPORT_STORE.get(report_id)
+            if not local_report:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Report not found"
+                )
+            if local_report.get("user_id") != current_user["uid"]:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to delete this report"
+                )
+            report_data = local_report
+
+        # 1. Clean up Pinecone vectors
+        try:
+            from tools.pinecone_tool import delete_report_chunks
+            delete_report_chunks(report_id)
+        except Exception as exc:
+            logger.warning("Pinecone vector deletion failed for report %s: %s", report_id, exc)
+
+        # 2. Clean up Firebase Storage PDF
+        pdf_url = report_data.get("pdfUrl") or report_data.get("pdf_url")
+        if pdf_url:
+            try:
+                bucket = get_storage()
+                blob = bucket.blob(f"reports/{report_id}.pdf")
+                if blob.exists():
+                    blob.delete()
+            except Exception as exc:
+                logger.warning("Firebase Storage deletion failed for report %s.pdf: %s", report_id, exc)
+
+        # 3. Clean up database entry
+        if has_firestore_doc:
+            try:
+                db = get_firestore()
+                db.collection("reports").document(report_id).delete()
+            except Exception as fe:
+                logger.warning("Could not delete report document in Firestore: %s", fe)
+
+        # Clean up local store fallback
+        if report_id in REPORT_STORE:
+            del REPORT_STORE[report_id]
+
+        logger.info(f"Report ID {report_id} successfully deleted by user: {current_user['uid']}")
+
+        return {
+            "success": True,
+            "message": "Report deleted successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Delete report endpoint failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete report"
+        )
 
 
 @app.post("/api/export/pdf", tags=["export"])
 async def export_pdf(
-    payload: PDFExportRequest,
+    payload: ExportPdfRequest,
     current_user: Dict[str, Any] = Depends(verify_token),
 ) -> Dict[str, Any]:
     """Generates PDF from a completed report and uploads to Firebase Storage."""
@@ -477,7 +799,7 @@ async def export_pdf(
         topic = ""
         report_id = payload.report_id
 
-        # 1. Try fetching from Firestore first
+        # Try Firestore
         try:
             db = get_firestore()
             doc_ref = db.collection("reports").document(report_id)
@@ -496,7 +818,7 @@ async def export_pdf(
         except Exception as fe:
             logger.warning("Firestore lookup failed, falling back to local REPORT_STORE: %s", fe)
 
-        # 2. Local fallback for testing/offline environments
+        # Fallback to local store
         if not report_data:
             local_report = REPORT_STORE.get(report_id)
             if not local_report:
@@ -520,7 +842,7 @@ async def export_pdf(
 
         from tools.pdf_export import generate_and_upload_pdf
 
-        # 3. Generate and upload PDF
+        # Generate and upload PDF
         result = generate_and_upload_pdf(
             report=report_data,
             topic=topic,
@@ -533,7 +855,7 @@ async def export_pdf(
                 detail=f"PDF generation failed: {result.get('error')}"
             )
 
-        # 4. Save URL back to Firestore
+        # Save URL back to Firestore
         try:
             db = get_firestore()
             db.collection("reports").document(report_id).update({
@@ -578,69 +900,34 @@ async def pdf_health() -> Dict[str, Any]:
         }
 
 
+# --- WEBSOCKET CHANNELS ---
+
 @app.websocket("/ws/research/{report_id}")
 async def websocket_endpoint(websocket: WebSocket, report_id: str) -> None:
-    """Stream live updates for a specific report id using the WebSocket manager."""
-    token = websocket.query_params.get("token")
-    if token:
-        try:
-            from firebase_admin import auth as firebase_auth
-            firebase_auth.verify_id_token(token)
-        except Exception:
-            await websocket.close(code=4401)
-            return
-
+    """Streams live research milestones, supporting ping/pong keep-alives."""
     await ws_manager.connect(websocket, report_id)
     try:
         while True:
-            data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_text("pong")
+            try:
+                # Wait for keep-alive packets or client events
+                data = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=30.0
+                )
+                if data == "ping":
+                    await websocket.send_text("pong")
+            except asyncio.TimeoutError:
+                # Dispatch keepalive ping to check connections
+                try:
+                    await websocket.send_json({
+                        "event": "keepalive",
+                        "message": "ping"
+                    })
+                except Exception:
+                    break
     except WebSocketDisconnect:
+        logger.info(f"WS disconnected gracefully for report: {report_id}")
+    except Exception as exc:
+        logger.error(f"WS error for report {report_id}: {exc}")
+    finally:
         await ws_manager.disconnect(report_id)
-
-
-# Placeholder agent routes keep the endpoint structure ready for the Day 5 orchestration layer.
-@app.post("/api/agent/orchestrator", tags=["agents"])
-async def orchestrator_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
-    """Placeholder route for the orchestrator agent."""
-    return {"status": "pending", "agent": "orchestrator", "user_id": current_user["uid"]}
-
-
-@app.post("/api/agent/search", tags=["agents"])
-async def search_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
-    """Placeholder route for the search agent."""
-    return {"status": "pending", "agent": "search", "user_id": current_user["uid"]}
-
-
-@app.post("/api/agent/summary", tags=["agents"])
-async def summary_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
-    """Placeholder route for the summary agent."""
-    return {"status": "pending", "agent": "summary", "user_id": current_user["uid"]}
-
-
-@app.post("/api/agent/factcheck", tags=["agents"])
-async def factcheck_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
-    """Placeholder route for the fact-check agent."""
-    return {"status": "pending", "agent": "factcheck", "user_id": current_user["uid"]}
-
-
-@app.post("/api/agent/writer", tags=["agents"])
-async def writer_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
-    """Placeholder route for the writer agent."""
-    return {"status": "pending", "agent": "writer", "user_id": current_user["uid"]}
-
-
-@app.post("/api/agent/followup", tags=["agents"])
-async def followup_placeholder(current_user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
-    """Placeholder route for the follow-up agent."""
-    return {"status": "pending", "agent": "followup", "user_id": current_user["uid"]}
-
-
-app.openapi_tags = [
-    {"name": "auth", "description": "Firebase login and current user endpoints"},
-    {"name": "research", "description": "Research lifecycle endpoints"},
-    {"name": "agents", "description": "Agent placeholders and orchestration hooks"},
-    {"name": "export", "description": "PDF export endpoints"},
-    {"name": "health", "description": "Health monitoring"},
-]
