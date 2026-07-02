@@ -423,10 +423,13 @@ async def health_tavily() -> Dict[str, Any]:
 
 @app.get("/api/health/websocket", tags=["health"])
 async def health_websocket() -> Dict[str, Any]:
-    """Return active connection counts inside WebSocketManager."""
+    """Return active connection statistics inside WebSocketManager."""
+    stats = ws_manager.get_connection_stats()
     return {
         "status": "healthy",
-        "active_connections": ws_manager.get_connected_count()
+        "active_connections": stats["active_connections"],
+        "reports_with_history": stats["reports_with_history"],
+        "connections": stats["connections"]
     }
 
 
@@ -904,7 +907,7 @@ async def pdf_health() -> Dict[str, Any]:
 
 @app.websocket("/ws/research/{report_id}")
 async def websocket_endpoint(websocket: WebSocket, report_id: str) -> None:
-    """Streams live research milestones, supporting ping/pong keep-alives."""
+    """Streams live research milestones, supporting ping/pong keep-alives, history playback, and disconnects."""
     await ws_manager.connect(websocket, report_id)
     try:
         while True:
@@ -916,17 +919,30 @@ async def websocket_endpoint(websocket: WebSocket, report_id: str) -> None:
                 )
                 if data == "ping":
                     await websocket.send_text("pong")
+                elif data == "history":
+                    # Client requesting event history manually
+                    history = ws_manager.get_event_history(report_id)
+                    await websocket.send_json({
+                        "event": "history",
+                        "agent": "system",
+                        "message": f"{len(history)} events",
+                        "data": {"events": history},
+                        "timestamp": int(time.time() * 1000)
+                    })
             except asyncio.TimeoutError:
                 # Dispatch keepalive ping to check connections
                 try:
                     await websocket.send_json({
                         "event": "keepalive",
-                        "message": "ping"
+                        "agent": "system",
+                        "message": "ping",
+                        "data": {},
+                        "timestamp": int(time.time() * 1000)
                     })
                 except Exception:
                     break
     except WebSocketDisconnect:
-        logger.info(f"WS disconnected gracefully for report: {report_id}")
+        logger.info(f"WS client disconnected: {report_id}")
     except Exception as exc:
         logger.error(f"WS error for report {report_id}: {exc}")
     finally:
