@@ -112,7 +112,8 @@ class ResearchRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     """User authentication payload containing client-side ID Token."""
-    token: str
+    token: Optional[str] = None
+    id_token: Optional[str] = None
 
 
 class ExportPdfRequest(BaseModel):
@@ -448,7 +449,10 @@ async def login_user(payload: LoginRequest) -> Dict[str, Any]:
     """Verify bearer token credentials with Firebase Admin and register user document."""
     try:
         from firebase_admin import auth as firebase_auth
-        decoded = firebase_auth.verify_id_token(payload.token)
+        token_val = payload.token or payload.id_token
+        if not token_val:
+            raise HTTPException(status_code=400, detail="Token payload not provided")
+        decoded = firebase_auth.verify_id_token(token_val)
         user = {
             "uid": decoded.get("uid"),
             "email": decoded.get("email"),
