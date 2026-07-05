@@ -49,20 +49,51 @@ export type AuthUser = {
   last_login_at: string | null
 }
 
-export type ReportData = {
+export interface KeyFinding {
+  point: string
+  citation: string
+  status: "verified" | "uncertain"
+}
+
+export interface Source {
+  url: string
+  title: string
+  credibility: string
+  credibility_icon: string
+}
+
+export interface ReportData {
+  title: string
+  language: string
+  executive_summary: string
+  key_findings: KeyFinding[]
+  detailed_analysis: string
+  limitations: string
+  conclusion: string
+  sources: Source[]
+  word_count: number
+  confidence_score: number
+  confidence_label: string
+  confidence_emoji: string
+  sub_questions_covered: string[]
+  total_sources_used: number
+  generated_at: string
   report_id: string
-  user_id: string
+}
+
+export interface FullReport {
+  report_id: string
   topic: string
   depth: string
   language: string
   status: string
-  confidence_score: number
-  source_credibility: Array<Record<string, unknown>>
-  thinking_logs: Array<Record<string, unknown>>
-  followup_questions: string[]
-  report_markdown: string
-  created_at: string
+  created_at: string | null
   completed_at: string | null
+  report_data: ReportData
+  confidence_score: number
+  pdf_url: string | null
+  followup_questions: string[]
+  error: string | null
 }
 
 export type ApiOptions = {
@@ -125,7 +156,7 @@ export const researchAPI = {
     }),
 
   /** Fetch a report by id. */
-  getReport: (reportId: string) => authFetch<ReportData>(`/api/research/${reportId}`),
+  getReport: (reportId: string) => authFetch<FullReport>(`/api/research/${reportId}`),
 
   /** Fetch the signed-in user's report history. */
   getHistory: () => authFetch<HistoryResponse>("/api/reports/history"),
@@ -138,7 +169,7 @@ export const researchAPI = {
 
   /** Request PDF export for a report. */
   exportPdf: (reportId: string) =>
-    authFetch<{ pdf_url: string }>("/api/export/pdf", {
+    authFetch<{ success: boolean; pdf_url: string }>("/api/export/pdf", {
       method: "POST",
       body: { report_id: reportId },
     }),

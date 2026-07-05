@@ -1,7 +1,7 @@
 "use client"
 
-import React, { useState, useEffect } from "react"
-import { useRouter } from "next/navigation"
+import React, { useState, useEffect, Suspense } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
 import { motion, AnimatePresence } from "framer-motion"
 import { toast } from "react-hot-toast"
 import { type User } from "firebase/auth"
@@ -191,8 +191,9 @@ const Spinner = ({ className = "h-5 w-5" }: { className?: string }) => (
 
 // --- MAIN HOME COMPONENT ---
 
-export default function Home() {
+function Home() {
   const router = useRouter()
+  const searchParams = useSearchParams()
 
   // State Management
   const [topic, setTopic] = useState("")
@@ -204,6 +205,14 @@ export default function Home() {
   const [authLoading, setAuthLoading] = useState(true)
   const [charCount, setCharCount] = useState(0)
   const [recentReports, setRecentReports] = useState<HistoryItem[]>([])
+
+  // Load topic from URL search param if present
+  useEffect(() => {
+    const topicParam = searchParams.get("topic")
+    if (topicParam) {
+      setTopic(decodeURIComponent(topicParam))
+    }
+  }, [searchParams])
 
   // Auth synchronization listener
   useEffect(() => {
@@ -661,5 +670,19 @@ export default function Home() {
         </div>
       </section>
     </main>
+  )
+}
+
+export default function HomePage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+          <Spinner className="h-8 w-8 text-blue-600" />
+        </div>
+      }
+    >
+      <Home />
+    </Suspense>
   )
 }
