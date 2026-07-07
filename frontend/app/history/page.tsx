@@ -4,7 +4,6 @@ import React, { useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
 import Link from "next/link"
 import { motion, AnimatePresence } from "framer-motion"
-import { toast } from "react-hot-toast"
 import { type User } from "firebase/auth"
 import {
   History,
@@ -24,6 +23,11 @@ import { onAuthChange } from "../../lib/firebase"
 import { researchAPI, type HistoryReport, type ReportStatus } from "../../lib/api"
 import ReportHistoryCard from "../../components/ReportHistoryCard"
 import DeleteConfirmModal from "../../components/DeleteConfirmModal"
+import PageTransition from "../../components/ui/PageTransition"
+import { showSuccess, showError, RESEARCH_TOASTS } from "../../components/ui/Toast"
+import { SkeletonCard } from "../../components/ui/Skeleton"
+import ErrorState from "../../components/ui/ErrorState"
+import EmptyState from "../../components/ui/EmptyState"
 
 interface DeleteModalState {
   isOpen: boolean
@@ -43,6 +47,7 @@ export default function HistoryPage() {
   const [statusFilter, setStatusFilter] = useState<"all" | ReportStatus>("all")
   const [isDeleting, setIsDeleting] = useState(false)
   const [user, setUser] = useState<User | null>(null)
+  const [limit, setLimit] = useState(20)
 
   const [deleteModal, setDeleteModal] = useState<DeleteModalState>({
     isOpen: false,
@@ -62,7 +67,7 @@ export default function HistoryPage() {
     const unsubscribe = onAuthChange((currentUser) => {
       setUser(currentUser)
       if (!currentUser) {
-        toast.error("Please sign in to view history")
+        showError(RESEARCH_TOASTS.SIGNIN_REQUIRED)
         router.push("/")
       }
     })
@@ -76,21 +81,28 @@ export default function HistoryPage() {
     }
   }, [user])
 
-  const fetchHistory = async () => {
+  const fetchHistory = async (customLimit?: number) => {
     setIsLoading(true)
     setError(null)
     try {
-      const response = await researchAPI.getHistory()
+      const currentLimit = customLimit || limit
+      const response = await researchAPI.getHistory(currentLimit)
       const reportsList = response.reports || []
       setReports(reportsList)
       setFilteredReports(reportsList)
       calculateStats(reportsList)
     } catch (err: any) {
       setError(err.message || "Failed to load report history")
-      toast.error("Could not load reports")
+      showError("Could not load reports")
     } finally {
       setIsLoading(false)
     }
+  }
+
+  const handleLoadMore = () => {
+    const newLimit = limit + 20
+    setLimit(newLimit)
+    fetchHistory(newLimit)
   }
 
   // 3. Stats calculations
@@ -149,10 +161,10 @@ export default function HistoryPage() {
       setReports(remainingReports)
       calculateStats(remainingReports)
 
-      toast.success("Report deleted successfully")
+      showSuccess(RESEARCH_TOASTS.REPORT_DELETED)
       setDeleteModal({ isOpen: false, reportId: null, topic: "" })
     } catch (err: any) {
-      toast.error("Delete failed. Please try again.")
+      showError("Delete failed. Please try again.")
     } finally {
       setIsDeleting(false)
     }
@@ -161,7 +173,12 @@ export default function HistoryPage() {
   // --- RENDER SECTIONS ---
 
   return (
-    <div className="min-h-screen bg-slate-50">
+    <PageTransition className="min-h-screen bg-slate-50">
+      {/* Pull-to-refresh mobile hint */}
+      <div className="block sm:hidden text-center py-1.5 text-[10px] font-bold text-slate-400 bg-slate-100/50 border-b border-slate-200/40 tracking-wider">
+        ↻ Pull down to refresh
+      </div>
+
       {/* PAGE HEADER */}
       <div className="bg-white border-b border-slate-200">
         <div className="max-w-5xl mx-auto px-4 py-6">
@@ -270,72 +287,35 @@ export default function HistoryPage() {
         {isLoading && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {[1, 2, 3, 4].map((i) => (
-              <div key={i} className="bg-white rounded-xl border border-slate-200 p-5">
-                <div className="flex gap-3 mb-3">
-                  <div className="w-2.5 h-2.5 rounded-full bg-slate-200 animate-pulse mt-1.5" />
-                  <div className="flex-1">
-                    <div className="h-4 bg-slate-200 rounded animate-pulse mb-2 w-3/4" />
-                    <div className="h-3 bg-slate-100 rounded animate-pulse w-1/3" />
-                  </div>
-                </div>
-                <div className="h-1.5 bg-slate-100 rounded-full animate-pulse mb-4" />
-                <div className="flex gap-2">
-                  <div className="h-8 bg-slate-100 rounded-lg animate-pulse flex-1" />
-                  <div className="h-8 w-8 bg-slate-100 rounded-lg animate-pulse" />
-                </div>
-              </div>
+              <SkeletonCard key={i} />
             ))}
           </div>
         )}
 
         {/* ERROR STATE */}
         {!isLoading && error && (
-          <div className="text-center py-16">
-            <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4 border border-red-200">
-              <FileX size={32} className="text-red-400" />
-            </div>
-            <h3 className="text-lg font-bold text-slate-700 mb-2">Could Not Load History</h3>
-            <p className="text-slate-500 text-sm mb-6 leading-relaxed max-w-sm mx-auto">{error}</p>
-            <button
-              type="button"
-              onClick={fetchHistory}
-              className="flex items-center gap-2 mx-auto px-5 py-3 bg-blue-600 text-white rounded-2xl text-sm font-semibold hover:bg-blue-700 transition-colors shadow-md shadow-blue-500/10"
-            >
-              <RefreshCw size={14} />
-              <span>Try Again</span>
-            </button>
-          </div>
+          <ErrorState
+            type="server"
+            message={error}
+            onRetry={() => fetchHistory()}
+          />
         )}
 
         {/* EMPTY STATE */}
         {!isLoading && !error && reports.length === 0 && (
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="text-center py-16"
-          >
-            <div className="w-24 h-24 bg-blue-50 rounded-full flex items-center justify-center mx-auto mb-6 border border-blue-100">
-              <History size={48} className="text-blue-400" />
-            </div>
-            <h3 className="text-xl font-extrabold text-slate-800 mb-2">No Research Yet</h3>
-            <p className="text-slate-500 mb-8 max-w-xs mx-auto text-sm leading-relaxed font-semibold">
-              Start your first AI-powered research, and your generated reports will appear here.
-            </p>
-            <Link
-              href="/"
-              className="inline-flex items-center gap-2 px-6 py-3.5 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl text-sm font-semibold transition-all shadow-md shadow-blue-500/10"
-            >
-              <Plus size={18} />
-              <span>Start First Research</span>
-            </Link>
-          </motion.div>
+          <EmptyState
+            title="No Research Yet"
+            description="Start your first AI-powered research, and your generated reports will appear here."
+            actionLabel="Start First Research"
+            onAction={() => router.push("/")}
+          />
         )}
 
         {/* EMPTY SEARCH RESULTS */}
         {!isLoading && !error && reports.length > 0 && filteredReports.length === 0 && (
           <div className="text-center py-16">
-            <Search size={40} className="text-slate-300 mx-auto mb-4" />
-            <h3 className="font-bold text-slate-650 mb-2 text-sm">No reports match your filters</h3>
+            <Search size={40} className="text-slate-300 mx-auto mb-4 animate-bounce" />
+            <h3 className="font-bold text-slate-600 mb-2 text-sm">No reports match your filters</h3>
             <button
               type="button"
               onClick={() => {
@@ -351,18 +331,34 @@ export default function HistoryPage() {
 
         {/* REPORT CARDS GRID */}
         {!isLoading && !error && filteredReports.length > 0 && (
-          <AnimatePresence mode="popLayout">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {filteredReports.map((report, index) => (
-                <ReportHistoryCard
-                  key={report.report_id}
-                  report={report}
-                  onDelete={handleDeleteClick}
-                  index={index}
-                />
-              ))}
-            </div>
-          </AnimatePresence>
+          <div className="space-y-8">
+            <AnimatePresence mode="popLayout">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {filteredReports.map((report, index) => (
+                  <ReportHistoryCard
+                    key={report.report_id}
+                    report={report}
+                    onDelete={handleDeleteClick}
+                    index={index}
+                  />
+                ))}
+              </div>
+            </AnimatePresence>
+
+            {/* LOAD MORE BUTTON */}
+            {reports.length >= limit && (
+              <div className="flex justify-center pt-4">
+                <button
+                  type="button"
+                  onClick={handleLoadMore}
+                  className="flex items-center gap-2 px-6 py-3 bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-semibold rounded-2xl text-sm transition-all shadow-sm"
+                >
+                  <RefreshCw size={14} className={clsx(isLoading && "animate-spin")} />
+                  <span>Load More Reports</span>
+                </button>
+              </div>
+            )}
+          </div>
         )}
 
         {/* RESULTS COUNT FOOTER */}
@@ -381,6 +377,6 @@ export default function HistoryPage() {
         onCancel={() => setDeleteModal({ isOpen: false, reportId: null, topic: "" })}
         isDeleting={isDeleting}
       />
-    </div>
+    </PageTransition>
   )
 }

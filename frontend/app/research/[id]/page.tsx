@@ -2,9 +2,12 @@
 
 import React, { useState, useEffect, useRef, useCallback } from "react"
 import { useParams, useRouter } from "next/navigation"
+import Link from "next/link"
 import { motion, AnimatePresence } from "framer-motion"
-import { toast } from "react-hot-toast"
 import { clsx } from "clsx"
+
+import PageTransition from "../../../components/ui/PageTransition"
+import { showSuccess, showError, RESEARCH_TOASTS } from "../../../components/ui/Toast"
 
 import {
   Brain,
@@ -134,6 +137,7 @@ export default function ResearchActivityPage() {
   const [pipelineFailedMessage, setPipelineFailedMessage] = useState("")
   const [apiChecking, setApiChecking] = useState(true)
   const [wsTimeoutError, setWsTimeoutError] = useState(false)
+  const [reconnectFailed, setReconnectFailed] = useState(false)
 
   // Refs configs
   const wsRef = useRef<ResearchWebSocket | null>(null)
@@ -260,7 +264,7 @@ export default function ResearchActivityPage() {
         addActivityLog(event.agent, event.message, "error")
         setPipelineFailed(true)
         setPipelineFailedMessage(event.message)
-        toast.error(`Agent Error: ${event.message}`)
+        showError(`Agent Error: ${event.message}`)
         break
 
       case "report_ready":
@@ -270,11 +274,12 @@ export default function ResearchActivityPage() {
         setProgress(100)
         setReportReady(true)
         addActivityLog("system", "Research report complete! Redirecting...", "success")
-        toast.success("Research completed successfully! 🎉")
+        showSuccess(RESEARCH_TOASTS.RESEARCH_COMPLETE)
 
+        // Give the user a little more time to click the new "View Report" button
         setTimeout(() => {
           router.push(`/report/${reportId}`)
-        }, 1500)
+        }, 5000)
         break
 
       default:
@@ -289,7 +294,7 @@ export default function ResearchActivityPage() {
       setAuthLoading(false)
       if (!currentUser) {
         setAuthError("Unauthorized user. Redirecting to sign in...")
-        toast.error("Please sign in to view this page.")
+        showError(RESEARCH_TOASTS.SIGNIN_REQUIRED)
         setTimeout(() => {
           router.push("/")
         }, 2000)
@@ -317,7 +322,7 @@ export default function ResearchActivityPage() {
           if (report.status === "done") {
             setProgress(100)
             setReportReady(true)
-            toast.success("Report is already generated! Redirecting...")
+            showSuccess("Report is already generated! Redirecting...")
             setTimeout(() => {
               router.push(`/report/${reportId}`)
             }, 1800)
@@ -352,14 +357,17 @@ export default function ResearchActivityPage() {
     // Only connect when auth is confirmed and report checks out
     if (authLoading || authError || apiChecking || reportNotFound || pipelineFailed || reportReady) return
 
-    const ws = new ResearchWebSocket(
+     const ws = new ResearchWebSocket(
       reportId,
       handleWSEvent,
       () => setWsStatus("connected"),
       () => setWsStatus("reconnecting"),
       (err) => {
         setWsStatus("disconnected")
-        toast.error(err)
+        if (err && (err.includes("closed") || err.includes("Maximum") || err.includes("reconnection"))) {
+          setReconnectFailed(true)
+        }
+        showError(err)
       }
     )
 
@@ -375,7 +383,7 @@ export default function ResearchActivityPage() {
     wsTimerRef.current = setTimeout(() => {
       if (wsRef.current && !wsRef.current.isConnected()) {
         setWsTimeoutError(true)
-        toast.error("WebSocket connection is taking longer than usual.")
+        showError("WebSocket connection is taking longer than usual.")
       }
     }, 10000)
 
@@ -399,29 +407,29 @@ export default function ResearchActivityPage() {
   // RENDER A: AUTHENTICATION ENFORCED REDIRECTS
   if (authLoading || authError) {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 text-center">
+      <PageTransition className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 text-center">
         <Spinner className="h-8 w-8 text-blue-600 mb-4" />
         <p className="text-sm font-semibold text-slate-500">
           {authError || "Validating secure session credentials..."}
         </p>
-      </div>
+      </PageTransition>
     )
   }
 
   // RENDER B: LOADING INITIAL REPORT STATUS
   if (apiChecking) {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 text-center">
+      <PageTransition className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 text-center">
         <Spinner className="h-8 w-8 text-blue-600 mb-4" />
         <p className="text-sm font-semibold text-slate-500">Checking research progress state...</p>
-      </div>
+      </PageTransition>
     )
   }
 
   // RENDER C: REPORT NOT FOUND (404)
   if (reportNotFound) {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto">
+      <PageTransition className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto">
         <div className="h-16 w-16 bg-red-50 text-red-500 rounded-3xl flex items-center justify-center mb-6 border border-red-100 shadow-sm">
           <AlertTriangle size={30} />
         </div>
@@ -437,14 +445,14 @@ export default function ResearchActivityPage() {
           <ArrowLeft size={16} />
           <span>Return to Dashboard</span>
         </button>
-      </div>
+      </PageTransition>
     )
   }
 
   // RENDER D: PIPELINE FAILURE (CRASH STATE)
   if (pipelineFailed) {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto">
+      <PageTransition className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto">
         <div className="h-16 w-16 bg-red-50 text-red-500 rounded-3xl flex items-center justify-center mb-6 border border-red-100 shadow-sm animate-bounce">
           <XCircle size={30} />
         </div>
@@ -463,13 +471,13 @@ export default function ResearchActivityPage() {
           <RefreshCw size={16} />
           <span>Create New Report</span>
         </button>
-      </div>
+      </PageTransition>
     )
   }
 
   // RENDER E: ACTIVE REAL-TIME MONITOR DASHBOARD
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col">
+    <PageTransition className="min-h-screen bg-slate-50 flex flex-col">
       {/* Sticky dashboard header info */}
       <header className="bg-white border-b border-slate-200/60 sticky top-[69px] z-30 transition-all duration-200">
         <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between gap-4">
@@ -483,7 +491,7 @@ export default function ResearchActivityPage() {
                 {topic || "Initializing pipeline agents..."}
               </h1>
             </div>
-            <p className="text-[10px] text-slate-400 font-bold tracking-wider mt-0.5 uppercase">
+            <p className="text-[10px] text-slate-400 font-bold tracking-wider mt-0.5 uppercase hidden md:block">
               ID: {reportId}
             </p>
           </div>
@@ -554,6 +562,29 @@ export default function ResearchActivityPage() {
               </div>
             </motion.div>
           )}
+
+          {reconnectFailed && (
+            <motion.div
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="flex items-start gap-3 bg-red-50 border border-red-200 rounded-2xl p-4 text-red-800 text-xs leading-normal shadow-sm"
+            >
+              <AlertTriangle className="text-red-500 h-5 w-5 mt-0.5 shrink-0 animate-bounce" />
+              <div>
+                <span className="font-bold block mb-0.5">Connection lost. Refresh to retry.</span>
+                <span>The real-time connection to the research agents was lost after multiple attempts.</span>
+                <button
+                  type="button"
+                  onClick={() => window.location.reload()}
+                  className="mt-2.5 flex items-center gap-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg px-3 py-1.5 font-bold transition-all duration-200"
+                >
+                  <RefreshCw size={12} />
+                  <span>Refresh Connection</span>
+                </button>
+              </div>
+            </motion.div>
+          )}
         </AnimatePresence>
 
         {/* PROGRESS BAR CARD */}
@@ -585,7 +616,7 @@ export default function ResearchActivityPage() {
         </div>
 
         {/* AGENTS GRID */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
           {agents.map((agent) => (
             <AgentCard key={agent.id} agent={agent} isActive={agent.status === "running"} />
           ))}
@@ -601,11 +632,19 @@ export default function ResearchActivityPage() {
             >
               <CheckCircle size={44} className="mx-auto mb-3.5 animate-pulse" />
               <h2 className="text-2xl font-extrabold mb-1">Research Completed!</h2>
-              <p className="text-green-100 text-sm font-semibold mb-4">
+              <p className="text-green-100 text-sm font-semibold mb-6">
                 Creating file compilation. Redirecting to your reader page...
               </p>
-              <div className="flex justify-center">
-                <Spinner className="h-6 w-6" />
+              <div className="flex justify-center items-center gap-3">
+                <Link
+                  href={`/report/${reportId}`}
+                  className="px-5 py-3 bg-white text-green-700 hover:bg-green-50 rounded-xl text-xs sm:text-sm font-bold transition-all shadow-md focus:outline-none"
+                >
+                  View Report
+                </Link>
+                <div className="flex items-center justify-center bg-white/20 p-2.5 rounded-full shrink-0">
+                  <Spinner className="h-6 w-6" />
+                </div>
               </div>
             </motion.div>
           )}
@@ -690,6 +729,6 @@ export default function ResearchActivityPage() {
           Don&apos;t close this page. The multi-agent pipeline is active. You can safely return later from your History dashboard.
         </p>
       </div>
-    </div>
+    </PageTransition>
   )
 }

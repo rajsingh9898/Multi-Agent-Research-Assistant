@@ -163,7 +163,7 @@ export const researchAPI = {
   getReport: (reportId: string) => authFetch<FullReport>(`/api/research/${reportId}`),
 
   /** Fetch the signed-in user's report history. */
-  getHistory: () => authFetch<HistoryResponse>("/api/reports/history"),
+  getHistory: (limit?: number) => authFetch<HistoryResponse>(`/api/reports/history${limit ? `?limit=${limit}` : ""}`),
 
   /** Delete a report by id. */
   deleteReport: (reportId: string) =>

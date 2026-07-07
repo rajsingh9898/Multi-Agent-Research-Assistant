@@ -181,7 +181,7 @@ export default function ReportHistoryCard({
                     ? "text-green-600"
                     : report.confidence_score >= 60
                     ? "text-yellow-600"
-                    : "text-red-650"
+                    : "text-red-600"
                 )}
               >
                 {report.confidence_score}%

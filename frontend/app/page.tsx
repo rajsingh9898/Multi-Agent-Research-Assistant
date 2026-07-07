@@ -3,8 +3,11 @@
 import React, { useState, useEffect, Suspense } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { motion, AnimatePresence } from "framer-motion"
-import { toast } from "react-hot-toast"
 import { type User } from "firebase/auth"
+import { clsx } from "clsx"
+
+import PageTransition from "../components/ui/PageTransition"
+import { showSuccess, showError, RESEARCH_TOASTS } from "../components/ui/Toast"
 
 import {
   Search,
@@ -117,7 +120,7 @@ function DepthCard({
       onClick={onClick}
       whileHover={{ scale: 1.02, y: -2 }}
       whileTap={{ scale: 0.98 }}
-      className={`flex flex-col items-start p-4 rounded-xl border-2 text-left transition-all duration-200 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-blue-500 ${
+      className={`flex flex-col items-start p-3 sm:p-4 rounded-xl border-2 text-left transition-all duration-200 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-blue-500 ${
         selected
           ? `${selectedClasses} ring-2 ring-offset-1 ring-opacity-50`
           : `border-slate-200 bg-white text-slate-800 ${hoverBorderClasses}`
@@ -260,21 +263,27 @@ function Home() {
   const handleSubmit = async (e: React.SyntheticEvent) => {
     e.preventDefault()
 
+    // Offline Guard
+    if (typeof window !== "undefined" && !navigator.onLine) {
+      showError(RESEARCH_TOASTS.ERROR_NETWORK)
+      return
+    }
+
     // 1. Validations
     if (!topic.trim()) {
-      toast.error("Please enter a research topic")
+      showError("Please enter a research topic")
       return
     }
     if (topic.trim().length < 3) {
-      toast.error("Topic query is too short (min 3 chars)")
+      showError("Topic query is too short (min 3 chars)")
       return
     }
     if (topic.length > 500) {
-      toast.error("Topic too long (max 500 characters)")
+      showError("Topic too long (max 500 characters)")
       return
     }
     if (!user) {
-      toast.error("Please sign in first to run research reports")
+      showError(RESEARCH_TOASTS.SIGNIN_REQUIRED)
       return
     }
 
@@ -285,15 +294,15 @@ function Home() {
     try {
       const result = await researchAPI.start(topic.trim(), depth, language)
       if (result && result.report_id) {
-        toast.success("Research pipeline started successfully!")
+        showSuccess(RESEARCH_TOASTS.RESEARCH_STARTED)
         router.push(`/research/${result.report_id}`)
       } else {
         throw new Error("No report ID was returned by the server")
       }
     } catch (err: any) {
-      const msg = err.message || "Failed to initiate research session"
+      const msg = err.message || RESEARCH_TOASTS.ERROR_GENERIC
       setError(msg)
-      toast.error(msg)
+      showError(msg)
     } finally {
       setIsLoading(false)
     }
@@ -356,7 +365,7 @@ function Home() {
   }
 
   return (
-    <main className="min-h-full py-8 md:py-12">
+    <PageTransition className="min-h-full py-8 md:py-12">
       {/* Hero Section */}
       <section className="text-center px-4 max-w-3xl mx-auto mb-10 md:mb-14">
         <motion.div initial="hidden" animate="visible" variants={heroVariants}>
@@ -365,7 +374,7 @@ function Home() {
             <span>AI-Powered Multi-Agent Pipeline</span>
           </div>
 
-          <h1 className="text-4xl sm:text-5xl md:text-6xl font-extrabold tracking-tight text-slate-900 mb-4 leading-tight">
+          <h1 className="text-3xl sm:text-5xl md:text-6xl font-extrabold tracking-tight text-slate-900 mb-4 leading-tight">
             Research Any Topic
             <span className="bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent block mt-1">
               In Under 60 Seconds
@@ -434,7 +443,7 @@ function Home() {
 
           {/* STATE 3, 4, 5, 6, 7: LOGGED IN STATES */}
           {!authLoading && user && (
-            <form onSubmit={handleSubmit} className="space-y-6 md:space-y-8">
+            <form onSubmit={handleSubmit} className={clsx("space-y-6 md:space-y-8", isLoading && "pointer-events-none")}>
               {/* Profile Greeting */}
               <div className="flex items-center gap-3 pb-3 border-b border-slate-100">
                 {user.photoURL ? (
@@ -460,9 +469,10 @@ function Home() {
                     Research Query Topic
                   </label>
                   <span
-                    className={`text-xs font-semibold ${
-                      charCount > 450 ? "text-red-500 animate-pulse" : "text-slate-400"
-                    }`}
+                    className={clsx(
+                      "text-xs font-semibold",
+                      charCount >= 450 ? "text-amber-500 font-bold animate-pulse" : "text-slate-400"
+                    )}
                   >
                     {charCount}/500
                   </span>
@@ -496,7 +506,7 @@ function Home() {
               {/* Depth Selector Cards */}
               <div className="space-y-3">
                 <label className="block text-sm font-semibold text-slate-700">Research Depth level</label>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="grid grid-cols-3 gap-2 sm:gap-3">
                   {depths.map((d) => (
                     <DepthCard
                       key={d.key}
@@ -543,7 +553,7 @@ function Home() {
               <div className="space-y-2 pt-2">
                 <motion.button
                   type="submit"
-                  disabled={isLoading || !topic.trim()}
+                  disabled={isLoading || !topic.trim() || topic.length > 500}
                   whileHover={{ scale: 1.01 }}
                   whileTap={{ scale: 0.99 }}
                   className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed text-white font-semibold py-4 px-6 rounded-2xl flex items-center justify-center gap-2.5 transition-all duration-200 hover:shadow-lg shadow-blue-500/10 text-base"
@@ -670,7 +680,7 @@ function Home() {
           </a>
         </div>
       </section>
-    </main>
+    </PageTransition>
   )
 }
 
