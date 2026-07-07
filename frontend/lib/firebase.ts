@@ -91,6 +91,9 @@ export async function signInWithGoogle(): Promise<{ user: AuthenticatedUser; bac
     const result = await signInWithPopup(auth, provider)
     const idToken = await result.user.getIdToken()
 
+    // Set cookie for middleware redirection protection
+    document.cookie = `auth_token=logged_in; path=/; max-age=3600; SameSite=Strict`
+
     const response = await fetch(`${backendBaseUrl}/api/auth/login`, {
       method: "POST",
       headers: {
@@ -126,6 +129,8 @@ export async function signInWithGoogle(): Promise<{ user: AuthenticatedUser; bac
  */
 export async function signOutUser(): Promise<void> {
   try {
+    // Clear cookie
+    document.cookie = "auth_token=; path=/; max-age=0"
     await signOut(getFirebaseAuth())
   } catch (error) {
     const message = error instanceof Error ? error.message : "Sign out failed"
@@ -154,7 +159,20 @@ export async function getIdToken(): Promise<string | null> {
  */
 export function onAuthChange(handler: AuthChangeHandler): () => void {
   try {
-    return onAuthStateChanged(getFirebaseAuth(), handler)
+    return onAuthStateChanged(getFirebaseAuth(), async (user) => {
+      if (user) {
+        try {
+          await user.getIdToken()
+          document.cookie = `auth_token=logged_in; path=/; max-age=3600; SameSite=Strict`
+        } catch {
+          // Fallback if token retrieval failed
+          document.cookie = "auth_token=; path=/; max-age=0"
+        }
+      } else {
+        document.cookie = "auth_token=; path=/; max-age=0"
+      }
+      handler(user)
+    })
   } catch (error) {
     const message = error instanceof Error ? error.message : "Auth listener failed"
     throw new Error(message)

@@ -21,10 +21,12 @@ export interface ResearchStartResponse {
   message: string
 }
 
-export interface HistoryItem {
+export type ReportStatus = "pending" | "running" | "done" | "failed"
+
+export interface HistoryReport {
   report_id: string
   topic: string
-  status: string
+  status: ReportStatus
   created_at: string | null
   confidence_score: number
   pdf_url: string | null
@@ -33,9 +35,11 @@ export interface HistoryItem {
   language: string
 }
 
+export type HistoryItem = HistoryReport
+
 export interface HistoryResponse {
   success: boolean
-  reports: HistoryItem[]
+  reports: HistoryReport[]
   count: number
 }
 
@@ -163,7 +167,7 @@ export const researchAPI = {
 
   /** Delete a report by id. */
   deleteReport: (reportId: string) =>
-    authFetch<{ message: string }>(`/api/reports/${reportId}`, {
+    authFetch<{ success: boolean; message: string }>(`/api/reports/${reportId}`, {
       method: "DELETE",
     }),
 

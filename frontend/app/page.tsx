@@ -594,6 +594,7 @@ function Home() {
                   done: "bg-green-500 shadow-green-200",
                   failed: "bg-red-500 shadow-red-200",
                   pending: "bg-amber-500 shadow-amber-200 animate-pulse",
+                  running: "bg-blue-500 shadow-blue-200 animate-pulse",
                 }[report.status] || "bg-slate-400"
 
                 return (
