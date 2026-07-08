@@ -8,14 +8,110 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 
 logger = logging.getLogger(__name__)
+
+# --- MOCK FIREBASE CLIENTS ---
+
+class MockDocument:
+    def __init__(self, data=None, exists=True):
+        self._data = data or {}
+        self.exists = exists
+    def to_dict(self):
+        return self._data
+    def get(self):
+        return self
+
+class MockDocRef:
+    def __init__(self, doc_id, collection):
+        self.id = doc_id
+        self.collection = collection
+    def set(self, data, merge=False):
+        if self.id not in self.collection.db_mock:
+            self.collection.db_mock[self.id] = {}
+        if merge:
+            self.collection.db_mock[self.id].update(data)
+        else:
+            self.collection.db_mock[self.id] = data
+    def update(self, data):
+        if self.id not in self.collection.db_mock:
+            self.collection.db_mock[self.id] = {}
+        self.collection.db_mock[self.id].update(data)
+    def delete(self):
+        if self.id in self.collection.db_mock:
+            del self.collection.db_mock[self.id]
+    def get(self):
+        data = self.collection.db_mock.get(self.id)
+        return MockDocument(data=data, exists=(data is not None))
+
+class MockStreamDoc:
+    def __init__(self, doc_id, data):
+        self.id = doc_id
+        self._data = data
+    def to_dict(self):
+        return self._data
+
+class MockCollection:
+    def __init__(self):
+        self.db_mock = {}
+    def document(self, doc_id):
+        return MockDocRef(doc_id, self)
+    def where(self, field, op, val):
+        return self
+    def order_by(self, field, direction=None):
+        return self
+    def limit(self, lim):
+        return self
+    def stream(self):
+        return [MockStreamDoc(k, v) for k, v in self.db_mock.items()]
+    def get(self):
+        return [MockStreamDoc(k, v) for k, v in self.db_mock.items()]
+
+class MockFirestoreClient:
+    def __init__(self):
+        self.collections = {}
+    def collection(self, name):
+        if name not in self.collections:
+            self.collections[name] = MockCollection()
+        return self.collections[name]
+
+_MOCK_FIRESTORE = MockFirestoreClient()
+
+class MockBlob:
+    def __init__(self, name):
+        self.name = name
+    def upload_from_string(self, data, content_type=None):
+        pass
+    def make_public(self):
+        pass
+    @property
+    def public_url(self):
+        return f"https://storage.googleapis.com/mock-bucket/{self.name}"
+
+class MockBucket:
+    def blob(self, name):
+        return MockBlob(name)
+
+_MOCK_STORAGE = MockBucket()
+
+# --- HELPER FUNCTIONS ---
+
+def _has_service_account() -> bool:
+    """Determine if a valid Firebase service account JSON file is configured."""
+    cred_path = os.getenv("FIREBASE_SERVICE_ACCOUNT")
+    if not cred_path:
+        return False
+    path = Path(cred_path)
+    if not path.is_absolute():
+        path = (Path(__file__).resolve().parents[1] / path).resolve()
+    return path.exists()
 
 
 def _get_service_account_path() -> str:
@@ -36,8 +132,13 @@ def _get_service_account_path() -> str:
 
 
 @lru_cache(maxsize=1)
-def initialize_firebase() -> firebase_admin.App:
-    """Initialize Firebase Admin exactly once and return the active app."""
+def initialize_firebase() -> Optional[firebase_admin.App]:
+    """Initialize Firebase Admin exactly once and return the active app, or Mock App if missing."""
+    if not _has_service_account():
+        logger.warning("Firebase service account JSON not found. Operating in MOCK mode.")
+        print("⚠️  Firebase service account JSON not found. Operating in MOCK mode.")
+        return None
+
     try:
         if firebase_admin._apps:
             return firebase_admin.get_app()
@@ -54,13 +155,17 @@ def initialize_firebase() -> firebase_admin.App:
 
 
 def get_firestore():
-    """Return a Firestore client, initializing Firebase if needed."""
+    """Return a Firestore client, initializing Firebase if needed. Falls back to mock client."""
+    if not _has_service_account():
+        return _MOCK_FIRESTORE
     initialize_firebase()
     return firestore.client()
 
 
 def get_storage():
-    """Return a Firebase Storage bucket, initializing Firebase if needed."""
+    """Return a Firebase Storage bucket, initializing Firebase if needed. Falls back to mock client."""
+    if not _has_service_account():
+        return _MOCK_STORAGE
     initialize_firebase()
     bucket_name = os.getenv("FIREBASE_STORAGE_BUCKET")
     if bucket_name:
