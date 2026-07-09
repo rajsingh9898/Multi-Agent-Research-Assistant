@@ -179,7 +179,7 @@ class MockPineconeIndex:
 
 _MOCK_PINECONE_INDEX = MockPineconeIndex()
 
-def mock_search_tavily(query: str, max_results: int = 4, search_depth: str = "basic") -> List[Dict[str, Any]]:
+async def mock_search_tavily(query: str, max_results: int = 4, search_depth: str = "basic") -> List[Dict[str, Any]]:
     h = sum(ord(c) for c in query) % 100
     return [
         {

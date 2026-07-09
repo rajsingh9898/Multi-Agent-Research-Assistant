@@ -98,7 +98,7 @@ class ResearchRequest(BaseModel):
 
     @validator("depth")
     def depth_valid(cls, v):
-        allowed = ["quick", "deep", "expert"]
+        allowed = ["quick", "balanced", "deep", "expert"]
         v = v.strip().lower()
         if v not in allowed:
             raise ValueError(f"Depth must be one of {allowed}")
@@ -227,13 +227,24 @@ async def run_pipeline_background(
 
         # 2. Run the complete pipeline
         from agents.orchestrator import start_research
-        final_state = await start_research(
-            report_id=report_id,
-            topic=topic,
-            depth=depth,
-            language=language,
-            user_id=user_id
+        from utils.retry import with_timeout
+
+        final_state = await with_timeout(
+            start_research(
+                report_id=report_id,
+                topic=topic,
+                depth=depth,
+                language=language,
+                user_id=user_id
+            ),
+            timeout_seconds=300.0,
+            fallback=None,
+            operation_name="Full Research Pipeline"
         )
+
+        if final_state is None:
+            logger.error(f"Research pipeline timed out after 5 minutes for report {report_id}")
+            raise TimeoutError("Research pipeline execution timed out after 5 minutes.")
 
         # 3. Retrieve final metrics
         final_report = final_state.get_field("final_report", {}) or {}

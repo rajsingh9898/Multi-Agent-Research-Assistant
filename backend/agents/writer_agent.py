@@ -88,6 +88,13 @@ def build_context(state: AgentMemory) -> Dict[str, Any]:
     verified = [c for c in all_claims if isinstance(c, dict) and c.get("status") == "verified"]
     uncertain = [c for c in all_claims if isinstance(c, dict) and c.get("status") == "uncertain"]
 
+    # Fallback rules
+    if len(verified) == 0:
+        logger.warning("No verified claims found! Using uncertain claims as fallback.")
+        verified = [c for c in all_claims if isinstance(c, dict) and c.get("status") in ["verified", "uncertain"]]
+        # Clear uncertain to avoid listing them twice in the prompt
+        uncertain = []
+
     # Format verified facts
     verified_facts_str = ""
     for i, claim in enumerate(verified, 1):
@@ -189,7 +196,18 @@ STRICT RULES:
 5. {language_instruction}
 6. Every section must have real content based on provided facts."""
 
-    user_prompt = f"""Write a comprehensive research report.
+    disclaimer = ""
+    # The warning uses verified facts count from the state before fallback was applied.
+    # Note that context["verified_count"] is the count after fallback, but we also check if no verified facts originally existed
+    if context.get("verified_count", 0) < 3:
+        disclaimer = (
+            "\n\nCRITICAL QUALITY NOTICE:\n"
+            "There are fewer than 3 verified facts in the source data. You MUST write a prominent quality disclaimer "
+            "paragraph at the start of the executive summary explaining that this report is based on limited or unverified "
+            "early sources and should be treated with appropriate caution regarding verification depth."
+        )
+
+    user_prompt = f"""Write a comprehensive research report.{disclaimer}
 
 TOPIC: {context['topic']}
 CONFIDENCE LEVEL: {context['confidence']}%
@@ -370,6 +388,16 @@ async def write_report(
     """
     try:
         state.set_current_agent("writer_agent")
+
+        verified_claims_only = [
+            c for c in (state.get_field("verified_claims", []) or [])
+            if isinstance(c, dict) and c.get("status") == "verified"
+        ]
+        if len(verified_claims_only) < 3:
+            state.add_thinking_log(
+                "writer_agent",
+                "Warning: Few verified claims. Report quality may be limited."
+            )
 
         verified_claims = state.get_field("verified_claims", []) or []
         summaries = state.get_all_summaries() or []

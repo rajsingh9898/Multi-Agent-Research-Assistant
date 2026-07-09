@@ -9,6 +9,7 @@ This module owns all Pinecone and embedding lifecycle concerns:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -231,63 +232,64 @@ def get_pinecone_index():
         raise RuntimeError(f"Failed to initialize Pinecone index '{index_name}': {exc}") from exc
 
 
-def create_embedding(text: str) -> List[float]:
+async def create_embedding(text: str) -> List[float]:
     """Create a single embedding with retry logic and text sanitization."""
     cleaned_text = _clean_text(text)
     if not cleaned_text:
         raise ValueError("Cannot embed empty text")
 
-    client = get_openai_client()
-    last_error: Optional[Exception] = None
-    for attempt in range(3):
-        try:
-            response = client.embeddings.create(model=EMBEDDING_MODEL, input=cleaned_text)
-            embedding = response.data[0].embedding
-            if len(embedding) != DEFAULT_DIMENSION:
-                raise RuntimeError(f"Unexpected embedding dimension: {len(embedding)}")
-            return [float(value) for value in embedding]
-        except Exception as exc:
-            last_error = exc
-            logger.warning("Embedding attempt %s failed: %s", attempt + 1, exc)
-            if attempt < 2:
-                time.sleep(2 ** attempt)
+    from utils.retry import (
+        async_retry,
+        OPENAI_RETRY_EXCEPTIONS
+    )
 
-    raise RuntimeError(f"Failed to create embedding after retries: {last_error}") from last_error
+    @async_retry(
+        max_attempts=3,
+        base_delay=2,
+        exceptions=OPENAI_RETRY_EXCEPTIONS
+    )
+    async def _create_embedding_with_retry(text_val):
+        client = get_openai_client()
+        response = client.embeddings.create(
+            input=text_val,
+            model=EMBEDDING_MODEL
+        )
+        return response.data[0].embedding
+
+    embedding = await _create_embedding_with_retry(cleaned_text)
+    if len(embedding) != DEFAULT_DIMENSION:
+        raise RuntimeError(f"Unexpected embedding dimension: {len(embedding)}")
+    return [float(value) for value in embedding]
 
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
-    """Split text into overlapping word chunks while filtering tiny fragments.
-
-    The chunker works on words so it behaves predictably for long documents,
-    but it preserves context by carrying over a configurable overlap window.
-    """
-    cleaned_text = re.sub(r"\s+", " ", (text or "").strip())
-    if not cleaned_text:
+    """Split clean text into semantic character chunks with overlap."""
+    if not text:
+        return []
+    cleaned = _clean_text(text)
+    if not cleaned:
         return []
 
-    words = cleaned_text.split(" ")
-    if len(words) <= chunk_size:
-        return [cleaned_text] if len(cleaned_text) >= 50 else []
-
+    words = cleaned.split(" ")
     chunks: List[str] = []
-    step = max(1, chunk_size - overlap)
-    for start in range(0, len(words), step):
-        end = min(len(words), start + chunk_size)
-        chunk = " ".join(words[start:end]).strip()
-        if len(chunk) >= 50:
+    i = 0
+    while i < len(words):
+        chunk_words = words[i: i + chunk_size]
+        chunk = " ".join(chunk_words)
+        if len(chunk.strip()) > 30:
             chunks.append(chunk)
-        if end >= len(words):
-            break
+        i += chunk_size - overlap
+
     return chunks
 
 
 def _build_vector_id(report_id: str, source_index: int, chunk_index: int, chunk_text_value: str) -> str:
-    """Build a stable vector identifier for a chunk."""
-    digest = hashlib.sha256(chunk_text_value.encode("utf-8")).hexdigest()[:16]
-    return f"{report_id}:{source_index}:{chunk_index}:{digest}"
+    """Build a unique deterministically hashed vector ID."""
+    raw = f"{report_id}_{source_index}_{chunk_index}_{chunk_text_value[:50]}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
-def upsert_source_chunks(
+async def upsert_source_chunks(
     content: str,
     source_url: str,
     source_title: str,
@@ -312,7 +314,7 @@ def upsert_source_chunks(
 
     for chunk_index, chunk in enumerate(chunks):
         try:
-            embedding = create_embedding(chunk)
+            embedding = await create_embedding(chunk)
         except Exception as exc:
             logger.warning(
                 "Skipping chunk %s from source %s because embedding failed: %s",
@@ -346,33 +348,56 @@ def upsert_source_chunks(
     if not vectors:
         return 0
 
+    from utils.retry import with_timeout
+
     stored = 0
     for batch_start in range(0, len(vectors), 100):
         batch = vectors[batch_start: batch_start + 100]
-        try:
-            index.upsert(vectors=batch)
+        batch_idx = batch_start // 100
+        
+        upsert_res = await with_timeout(
+            asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: index.upsert(vectors=batch)
+            ),
+            timeout_seconds=30.0,
+            fallback=None,
+            operation_name=f"Pinecone upsert batch {batch_idx}"
+        )
+        
+        if upsert_res is not None:
             stored += len(batch)
-        except Exception as exc:
-            logger.exception("Failed to upsert Pinecone batch for report %s", report_id)
-            raise RuntimeError(f"Failed to upsert Pinecone batch for report '{report_id}': {exc}") from exc
+        else:
+            logger.warning(f"Pinecone upsert batch {batch_idx} timed out or failed. Skipping batch.")
 
     return stored
 
 
-def query_relevant_chunks(question: str, report_id: str, top_k: int = 5) -> List[Dict[str, Any]]:
+async def query_relevant_chunks(question: str, report_id: str, top_k: int = 5) -> List[Dict[str, Any]]:
     """Return the most relevant chunks for a question within one report."""
     index = get_pinecone_index()
-    embedding = create_embedding(question)
-    try:
-        results = index.query(
-            vector=embedding,
-            top_k=top_k,
-            include_metadata=True,
-            filter={"report_id": {"$eq": report_id}},
-        )
-    except Exception as exc:
-        logger.exception("Failed to query Pinecone for report %s", report_id)
-        raise RuntimeError(f"Failed to query Pinecone for report '{report_id}': {exc}") from exc
+    embedding = await create_embedding(question)
+    
+    from utils.retry import with_timeout
+    
+    results = await with_timeout(
+        asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: index.query(
+                vector=embedding,
+                top_k=top_k,
+                include_metadata=True,
+                filter={"report_id": {"$eq": report_id}},
+            )
+        ),
+        timeout_seconds=10.0,
+        fallback=None,
+        operation_name="Pinecone query"
+    )
+
+    if results is None:
+        logger.warning("Pinecone query timed out, returning empty chunks")
+        return []
 
     matches = results.get("matches", []) if isinstance(results, dict) else getattr(results, "matches", [])
     formatted: List[Dict[str, Any]] = []
@@ -407,9 +432,9 @@ def query_relevant_chunks(question: str, report_id: str, top_k: int = 5) -> List
     return formatted
 
 
-def query_claim_evidence(claim: str, report_id: str, top_k: int = 3) -> List[Dict[str, Any]]:
+async def query_claim_evidence(claim: str, report_id: str, top_k: int = 3) -> List[Dict[str, Any]]:
     """Return the strongest evidence chunks for a fact-checking claim."""
-    return query_relevant_chunks(claim, report_id=report_id, top_k=top_k)
+    return await query_relevant_chunks(claim, report_id=report_id, top_k=top_k)
 
 
 def delete_report_chunks(report_id: str) -> bool:

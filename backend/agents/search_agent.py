@@ -95,7 +95,7 @@ async def search_single_question(
         state.add_thinking_log("search_agent", f"Searching for: {question}")
 
         # 3. Call search_for_question() from tavily_tool
-        result = search_for_question(question=question, report_id=report_id)
+        result = await search_for_question(question=question, report_id=report_id)
 
         # 4. Handle empty results
         source_count = result.get("source_count", 0)

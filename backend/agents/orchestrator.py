@@ -28,9 +28,11 @@ logger = logging.getLogger(__name__)
 # Constants
 DEPTH_QUESTION_COUNT: Dict[str, int] = {
     "quick": 3,
+    "balanced": 4,
     "deep": 4,
     "expert": 6
 }
+
 DEFAULT_DEPTH: str = "deep"
 MODEL: str = "gpt-4o-mini"
 
@@ -218,6 +220,16 @@ def parse_questions_from_response(
         return []
 
 
+def validate_and_clean_topic(topic: str) -> str:
+    if not topic or not topic.strip():
+        raise ValueError("Topic cannot be empty")
+    cleaned = topic.strip()
+    if len(cleaned) > 500:
+        cleaned = cleaned[:500]
+        logger.warning(f"Topic truncated to 500 chars")
+    return cleaned
+
+
 async def generate_sub_questions(
     state: AgentMemory, report_id: str
 ) -> List[str]:
@@ -232,6 +244,17 @@ async def generate_sub_questions(
     """
     try:
         topic = state.get_field("topic", "")
+        
+        # Clean and validate topic
+        try:
+            topic = validate_and_clean_topic(topic)
+            state.update_state("topic", topic)
+        except ValueError as val_err:
+            logger.error(f"Topic validation failed: {val_err}")
+            state.set_error(str(val_err))
+            await ws_manager.emit_error(report_id, "orchestrator", str(val_err))
+            return []
+
         depth = state.get_field("depth", DEFAULT_DEPTH)
         language = state.get_field("language", "english")
 
@@ -249,7 +272,6 @@ async def generate_sub_questions(
             topic, question_count, validated_lang
         )
 
-        attempts = 3
         response_text = ""
         openai_client = None
         api_failed = False
@@ -263,32 +285,38 @@ async def generate_sub_questions(
             api_error_details = str(e)
 
         if not api_failed and openai_client:
-            for attempt in range(1, attempts + 1):
-                try:
-                    logger.info(f"Calling OpenAI chat completions API (attempt {attempt}/3)...")
-                    response = openai_client.chat.completions.create(
-                        model=MODEL,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        temperature=0.7,
-                    )
-                    response_text = response.choices[0].message.content or ""
-                    if response_text.strip():
-                        break
-                    else:
-                        raise ValueError("Received empty response from OpenAI API.")
-                except Exception as exc:
-                    logger.warning(f"Attempt {attempt} failed: {exc}")
-                    if attempt == 1:
-                        await asyncio.sleep(2)
-                    elif attempt == 2:
-                        await asyncio.sleep(5)
-                    else:
-                        logger.error(f"All {attempts} API calls failed: {exc}")
-                        api_failed = True
-                        api_error_details = str(exc)
+            from utils.retry import (
+                async_retry, OPENAI_RETRY_EXCEPTIONS, OPENAI_NO_RETRY_EXCEPTIONS
+            )
+
+            @async_retry(
+                max_attempts=3,
+                base_delay=2,
+                exceptions=OPENAI_RETRY_EXCEPTIONS,
+                exclude_exceptions=OPENAI_NO_RETRY_EXCEPTIONS
+            )
+            async def call_gpt4o(prompt_system, prompt_user):
+                logger.info("Calling OpenAI chat completions API via async_retry...")
+                response = openai_client.chat.completions.create(
+                    model=MODEL,
+                    messages=[
+                        {"role": "system", "content": prompt_system},
+                        {"role": "user", "content": prompt_user}
+                    ],
+                    max_tokens=400,
+                    temperature=0.1
+                )
+                res_content = response.choices[0].message.content or ""
+                if not res_content.strip():
+                    raise ValueError("Received empty response from OpenAI API.")
+                return res_content
+
+            try:
+                response_text = await call_gpt4o(system_prompt, user_prompt)
+            except Exception as exc:
+                logger.error(f"All OpenAI retry attempts failed for orchestrator: {exc}")
+                api_failed = True
+                api_error_details = str(exc)
 
         questions = []
         if not api_failed and response_text:

@@ -173,7 +173,7 @@ async def process_single_source(
         }
 
         # 5. Call upsert_source_chunks()
-        chunks_stored = upsert_source_chunks(
+        chunks_stored = await upsert_source_chunks(
             content=content,
             source_url=url,
             source_title=title,
@@ -395,7 +395,7 @@ def get_embedding_stats(state: AgentMemory) -> Dict[str, Any]:
 # Added on Day 11
 # ════════════════════════════════════════════
 
-def retrieve_chunks_for_question(
+async def retrieve_chunks_for_question(
     question: str,
     report_id: str,
     top_k: int = 5
@@ -413,7 +413,7 @@ def retrieve_chunks_for_question(
     from tools.pinecone_tool import query_relevant_chunks
     try:
         logger.info(f"Querying Pinecone for: {question[:50]}")
-        chunks = query_relevant_chunks(
+        chunks = await query_relevant_chunks(
             question=question,
             report_id=report_id,
             top_k=top_k
@@ -619,7 +619,7 @@ async def summarize_single_question(
         )
 
         # Retrieve chunks
-        chunks = retrieve_chunks_for_question(
+        chunks = await retrieve_chunks_for_question(
             question=question,
             report_id=report_id,
             top_k=5

@@ -133,7 +133,29 @@ def emit_thinking_log(report_id: str, thought: str) -> None:
         logger.debug(f"Failed to broadcast thinking log: {e}")
 
 
-def search(query: str, max_results: int = 4, search_depth: str = "basic") -> List[Dict[str, Any]]:
+from utils.retry import async_retry
+
+@async_retry(
+    max_attempts=3,
+    base_delay=2,
+    exceptions=(Exception,),
+    exclude_exceptions=(ValueError,)
+)
+async def _tavily_search(query: str, max_results: int, search_depth: str) -> List[Dict[str, Any]]:
+    client = initialize_tavily()
+    response = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: client.search(
+            query=query,
+            search_depth=search_depth,
+            max_results=max_results,
+            include_answer=False
+        )
+    )
+    return response.get("results", [])
+
+
+async def search(query: str, max_results: int = 4, search_depth: str = "basic") -> List[Dict[str, Any]]:
     """Call Tavily API and return raw search results list.
 
     Validates query, handles rate limit (429) retries, timeout retries,
@@ -148,71 +170,23 @@ def search(query: str, max_results: int = 4, search_depth: str = "basic") -> Lis
         logger.info(f"Query length is {len(query)} chars. Truncating to 400 chars.")
         query = query[:400]
 
-    client = initialize_tavily()
+    from utils.retry import with_timeout
 
-    timeout_retries = 3
-    timeout_delay = 2.0
-    rate_limit_retried = False
+    results = await with_timeout(
+        _tavily_search(query, max_results, search_depth),
+        timeout_seconds=15.0,
+        fallback=[],
+        operation_name=f"Tavily search for query: {query[:30]}"
+    )
 
-    attempt = 0
-    while attempt <= timeout_retries:
-        try:
-            logger.info(f"Executing Tavily search. Query: {query} | Max results: {max_results} | Depth: {search_depth}")
-            response = client.search(
-                query=query,
-                search_depth=search_depth,
-                max_results=max_results
-            )
-            results = response.get("results", [])
-            if not results:
-                logger.info("Tavily search returned no results.")
-                return []
-            return results
+    if not results or len(results) == 0:
+        logger.warning(
+            f"Tavily returned 0 results for: "
+            f"{query[:50]}"
+        )
+        return []
 
-        except InvalidAPIKeyError as exc:
-            logger.error("Tavily API Key is invalid (401).")
-            raise ValueError(f"Invalid Tavily API key: {exc}") from exc
-
-        except UsageLimitExceededError as exc:
-            if not rate_limit_retried:
-                logger.warning("Tavily Rate Limit or Usage Limit exceeded (429). Retrying after 60s delay...")
-                time.sleep(60.0)
-                rate_limit_retried = True
-                continue
-            else:
-                logger.error("Tavily API limit exceeded again after 60s cooldown.")
-                raise RuntimeError(f"Tavily usage limit exceeded: {exc}") from exc
-
-        except (requests.exceptions.Timeout, requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as exc:
-            attempt += 1
-            if attempt <= timeout_retries:
-                logger.warning(f"Tavily timeout encountered (attempt {attempt}/{timeout_retries}). Retrying in {timeout_delay}s... Error: {exc}")
-                time.sleep(timeout_delay)
-            else:
-                logger.error("Tavily search timed out. Max retries exhausted.")
-                return []
-
-        except Exception as exc:
-            # Handle potential HTTP Errors raised by requests underlying client
-            if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
-                status_code = exc.response.status_code
-                if status_code == 401:
-                    logger.error("Tavily 401 Unauthorized HTTP response.")
-                    raise ValueError(f"Invalid Tavily API key: {exc}") from exc
-                elif status_code == 429:
-                    if not rate_limit_retried:
-                        logger.warning("Tavily 429 Rate Limit HTTP response. Retrying after 60s delay...")
-                        time.sleep(60.0)
-                        rate_limit_retried = True
-                        continue
-                    else:
-                        logger.error("Tavily 429 Limit exceeded after 60s cooldown.")
-                        raise RuntimeError(f"Tavily API limit exceeded: {exc}") from exc
-
-            logger.exception("Unexpected exception during Tavily search")
-            return []
-
-    return []
+    return results
 
 
 def filter_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -321,7 +295,7 @@ def format_results(results: List[Dict[str, Any]], sub_question: str) -> List[Dic
     return formatted
 
 
-def search_for_question(question: str, report_id: str) -> Dict[str, Any]:
+async def search_for_question(question: str, report_id: str) -> Dict[str, Any]:
     """Complete pipeline execution for a single sub-question.
 
     Performs query search, filters results, formats results, emits logs, and calculates average credibility.
@@ -330,7 +304,7 @@ def search_for_question(question: str, report_id: str) -> Dict[str, Any]:
     emit_thinking_log(report_id, f"Searching web for: {question}")
 
     # Search
-    raw_results = search(query=question, max_results=4, search_depth="basic")
+    raw_results = await search(query=question, max_results=4, search_depth="basic")
 
     # Filter
     filtered_results = filter_results(raw_results)
@@ -350,7 +324,7 @@ def search_for_question(question: str, report_id: str) -> Dict[str, Any]:
     }
 
 
-def search_all_questions(sub_questions: List[str], report_id: str) -> List[Dict[str, Any]]:
+async def search_all_questions(sub_questions: List[str], report_id: str) -> List[Dict[str, Any]]:
     """Loop through all sub-questions sequentially, sleeping 1s between calls to avoid rate limits."""
     results: List[Dict[str, Any]] = []
     total = len(sub_questions)
@@ -360,11 +334,11 @@ def search_all_questions(sub_questions: List[str], report_id: str) -> List[Dict[
         logger.info(progress_str)
         emit_thinking_log(report_id, progress_str)
 
-        res = search_for_question(question, report_id)
+        res = await search_for_question(question, report_id)
         results.append(res)
 
         if idx < total:
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
     return results
 

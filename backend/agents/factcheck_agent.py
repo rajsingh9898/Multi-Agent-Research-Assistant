@@ -189,7 +189,7 @@ def extract_claims(
         return []
 
 
-def verify_single_claim(
+async def verify_single_claim(
     claim: str,
     report_id: str,
     question: str
@@ -216,7 +216,7 @@ def verify_single_claim(
         }
 
     try:
-        evidence_chunks = query_claim_evidence(
+        evidence_chunks = await query_claim_evidence(
             claim=claim,
             report_id=report_id,
             top_k=5
@@ -350,7 +350,7 @@ async def process_single_summary(
             f"Verifying claim {i}/{len(claims)}: {claim[:50]}..."
         )
 
-        result = verify_single_claim(
+        result = await verify_single_claim(
             claim=claim,
             report_id=report_id,
             question=question

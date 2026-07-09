@@ -394,6 +394,96 @@ export default function ResearchActivityPage() {
     }
   }, [reportId, handleWSEvent, startTime, authLoading, authError, apiChecking, reportNotFound, pipelineFailed, reportReady])
 
+  // --- EFFECT: POLLING FALLBACK AFTER 5 WS RECONNECT ATTEMPTS ---
+  useEffect(() => {
+    if (!reconnectFailed || reportReady || pipelineFailed) return
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const report = await researchAPI.getReport(reportId)
+        if (report) {
+          if (report.status === "done") {
+            clearInterval(pollInterval)
+            setProgress(100)
+            setReportReady(true)
+            showSuccess("Research completed! (Fetched via backup polling)")
+            router.push(`/report/${reportId}`)
+          } else if (report.status === "failed") {
+            clearInterval(pollInterval)
+            setPipelineFailed(true)
+            setPipelineFailedMessage("The research pipeline failed.")
+          }
+        }
+      } catch (err) {
+        console.warn("Polling fallback failed:", err)
+      }
+    }, 10000)
+
+    return () => clearInterval(pollInterval)
+  }, [reconnectFailed, reportId, reportReady, pipelineFailed, router])
+
+  // --- EFFECT: LOCALSTORAGE PERSISTENCE (ACTIVE TAB SENDS STATUS) ---
+  useEffect(() => {
+    if (wsStatus !== "connected" || apiChecking || reportNotFound || !reportId) return
+    const stateData = {
+      agents,
+      activityLog,
+      thinkingLogs,
+      progress,
+      topic,
+      reportReady,
+      pipelineFailed,
+      pipelineFailedMessage
+    }
+    localStorage.setItem(`research_state_${reportId}`, JSON.stringify(stateData))
+  }, [reportId, wsStatus, agents, activityLog, thinkingLogs, progress, topic, reportReady, pipelineFailed, pipelineFailedMessage, apiChecking, reportNotFound])
+
+  // --- EFFECT: LOCALSTORAGE SYNC (INACTIVE TAB RECEIVES STATUS) ---
+  useEffect(() => {
+    if (!reportId || wsStatus === "connected") return
+
+    const handleStorageChange = (e: StorageEvent) => {
+      if (e.key === `research_state_${reportId}` && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue)
+          setAgents(parsed.agents)
+          setActivityLog(parsed.activityLog)
+          setThinkingLogs(parsed.thinkingLogs)
+          setProgress(parsed.progress)
+          setTopic(parsed.topic)
+          setReportReady(parsed.reportReady)
+          setPipelineFailed(parsed.pipelineFailed)
+          setPipelineFailedMessage(parsed.pipelineFailedMessage)
+        } catch (err) {
+          console.error("Error parsing synced state from storage:", err)
+        }
+      }
+    }
+
+    window.addEventListener("storage", handleStorageChange)
+    
+    // Also load initial state from localstorage on mount/reconnect lost
+    const existingState = localStorage.getItem(`research_state_${reportId}`)
+    if (existingState) {
+      try {
+        const parsed = JSON.parse(existingState)
+        setAgents(parsed.agents)
+        setActivityLog(parsed.activityLog)
+        setThinkingLogs(parsed.thinkingLogs)
+        setProgress(parsed.progress)
+        setTopic(parsed.topic)
+        setReportReady(parsed.reportReady)
+        setPipelineFailed(parsed.pipelineFailed)
+        setPipelineFailedMessage(parsed.pipelineFailedMessage)
+      } catch (err) {
+        // Ignore parsing errors
+      }
+    }
+
+    return () => window.removeEventListener("storage", handleStorageChange)
+  }, [reportId, wsStatus])
+
+
   // --- EFFECT: AUTO-SCROLL LOGS ---
 
   useEffect(() => {
