@@ -343,41 +343,55 @@ async def process_single_summary(
         f"Summary {summary_index}: extracted {len(claims)} claims to verify"
     )
 
+    # ── PARALLEL VERIFICATION ──
+    # Limit concurrent Pinecone queries to 5
+    semaphore = asyncio.Semaphore(5)
+
+    async def verify_with_semaphore(claim_val, claim_i):
+        async with semaphore:
+            await ws_manager.emit_agent_update(
+                report_id, "factcheck_agent",
+                f"Verifying claim {claim_i}/{len(claims)}: {claim_val[:45]}..."
+            )
+            res = await verify_single_claim(
+                claim=claim_val,
+                report_id=report_id,
+                question=question
+            )
+            # Emit thinking with emoji indicators
+            status_emoji = {
+                "verified": "✅",
+                "uncertain": "⚠️",
+                "unverified": "❌"
+            }.get(res["status"], "❓")
+
+            await ws_manager.emit_thinking(
+                report_id, "factcheck_agent",
+                f"{status_emoji} '{claim_val[:45]}...' -> {res['status']} ({res['evidence_count']} sources)"
+            )
+
+            state.add_thinking_log(
+                "factcheck_agent",
+                f"Claim {claim_i}: {res['status']} - {res['evidence_count']} supporting sources"
+            )
+            return res
+
+    verify_tasks = [
+        verify_with_semaphore(claim, idx)
+        for idx, claim in enumerate(claims, 1)
+    ]
+
+    raw_results = await asyncio.gather(*verify_tasks, return_exceptions=True)
     results = []
-    for i, claim in enumerate(claims, 1):
-        await ws_manager.emit_agent_update(
-            report_id, "factcheck_agent",
-            f"Verifying claim {i}/{len(claims)}: {claim[:50]}..."
-        )
 
-        result = await verify_single_claim(
-            claim=claim,
-            report_id=report_id,
-            question=question
-        )
-
-        results.append(result)
-
-        # Emit thinking with emoji indicators
-        status_emoji = {
-            "verified": "✅",
-            "uncertain": "⚠️",
-            "unverified": "❌"
-        }.get(result["status"], "❓")
-
-        await ws_manager.emit_thinking(
-            report_id, "factcheck_agent",
-            f"{status_emoji} '{claim[:45]}...' -> {result['status']} ({result['evidence_count']} sources)"
-        )
-
-        state.add_thinking_log(
-            "factcheck_agent",
-            f"Claim {i}: {result['status']} - {result['evidence_count']} supporting sources"
-        )
-
-        await asyncio.sleep(0.2)
+    for result in raw_results:
+        if isinstance(result, Exception):
+            logger.error(f"Claim verification error: {result}")
+        elif result is not None:
+            results.append(result)
 
     logger.info(f"Summary {summary_index}: {len(results)} claims verified.")
+
     return results
 
 
@@ -443,16 +457,34 @@ async def run(
             f"Starting fact-check on {total} summaries"
         )
 
+        # ── PARALLEL SUMMARY PROCESSING ──
+        # Limit concurrent summary processing to 2 because each verification is already parallel
+        semaphore = asyncio.Semaphore(2)
+
+        async def process_with_semaphore(summary, index):
+            async with semaphore:
+                return await process_single_summary(
+                    summary_dict=summary,
+                    summary_index=index,
+                    total_summaries=total,
+                    report_id=report_id,
+                    state=state
+                )
+
+        summary_tasks = [
+            process_with_semaphore(s, i+1)
+            for i, s in enumerate(summaries)
+        ]
+
+        raw_results = await asyncio.gather(*summary_tasks, return_exceptions=True)
+
         all_results = []
-        for i, summary in enumerate(summaries, 1):
-            results = await process_single_summary(
-                summary_dict=summary,
-                summary_index=i,
-                total_summaries=total,
-                report_id=report_id,
-                state=state
-            )
-            all_results.extend(results)
+        for result in raw_results:
+            if isinstance(result, Exception):
+                logger.error(f"Summary process error: {result}")
+            elif isinstance(result, list):
+                all_results.extend(result)
+
 
         if not all_results:
             error = "No claims could be extracted"

@@ -260,41 +260,56 @@ async def embed_and_store(state: AgentMemory, report_id: str) -> Dict[str, Any]:
             f"Embedding {total_sources} sources into Pinecone"
         )
 
-        # -- PROCESS EACH SOURCE --
-        results = []
+        # -- PROCESS SOURCES IN PARALLEL --
+        # Limit concurrent embedding calls to 5
+        semaphore = asyncio.Semaphore(5)
+        completed_count = 0
         total_chunks = 0
         failed_sources = 0
 
-        for i, source in enumerate(all_sources, 1):
-            result = await process_single_source(
-                source=source,
-                source_index=i,
-                total_sources=total_sources,
-                report_id=report_id,
-                state=state
-            )
+        async def embed_with_semaphore(source, index, total):
+            nonlocal completed_count
+            async with semaphore:
+                res = await process_single_source(
+                    source=source,
+                    source_index=index,
+                    total_sources=total,
+                    report_id=report_id,
+                    state=state
+                )
+                completed_count += 1
+                percent = int((completed_count / total) * 100)
+                if percent in [25, 50, 75]:
+                    await ws_manager.emit_agent_update(
+                        report_id, "summary_agent",
+                        f"Stored chunks ({percent}% complete)",
+                        data={
+                            "percent": percent
+                        }
+                    )
+                return res
 
-            results.append(result)
+        embed_tasks = [
+            embed_with_semaphore(source=source, index=i+1, total=total_sources)
+            for i, source in enumerate(all_sources)
+        ]
 
-            if result["status"] == "success":
-                total_chunks += result["chunks"]
+        raw_results = await asyncio.gather(*embed_tasks, return_exceptions=True)
+        results = []
+
+        for result in raw_results:
+            if isinstance(result, Exception):
+                logger.error(f"Embedding error: {result}")
+                failed_sources += 1
+            elif result is not None:
+                results.append(result)
+                if result.get("status") == "success":
+                    total_chunks += result.get("chunks", 0)
+                else:
+                    failed_sources += 1
             else:
                 failed_sources += 1
 
-            # -- PROGRESS MILESTONES (25%, 50%, 75%) --
-            percent = int((i / total_sources) * 100)
-            if percent in [25, 50, 75]:
-                await ws_manager.emit_agent_update(
-                    report_id, "summary_agent",
-                    f"Stored {total_chunks} chunks ({percent}% complete)",
-                    data={
-                        "chunks_stored": total_chunks,
-                        "percent": percent
-                    }
-                )
-
-            # Small delay to avoid rate limiting
-            await asyncio.sleep(0.1)
 
         # -- CHECK RESULTS --
         success_count = total_sources - failed_sources
@@ -772,29 +787,41 @@ async def retrieve_and_summarize(
         # Wait for Pinecone to fully index vectors
         await asyncio.sleep(2)
 
+        # -- SUMMARIZE QUESTIONS IN PARALLEL --
+        # Limit concurrent GPT-4o calls to 3
+        semaphore = asyncio.Semaphore(3)
+
+        async def summarize_with_semaphore(question, index):
+            async with semaphore:
+                return await summarize_single_question(
+                    question=question,
+                    question_index=index,
+                    total_questions=total,
+                    report_id=report_id,
+                    language=language,
+                    state=state
+                )
+
+        summarize_tasks = [
+            summarize_with_semaphore(question=q, index=i+1)
+            for i, q in enumerate(sub_questions)
+        ]
+
+        raw_summaries = await asyncio.gather(*summarize_tasks, return_exceptions=True)
         summaries = []
         failed_count = 0
 
-        for i, question in enumerate(sub_questions, 1):
-            result = await summarize_single_question(
-                question=question,
-                question_index=i,
-                total_questions=total,
-                report_id=report_id,
-                language=language,
-                state=state
-            )
-
-            if result is not None:
+        for i, result in enumerate(raw_summaries):
+            if isinstance(result, Exception):
+                logger.error(f"Summarize error for Q{i+1}: {result}")
+                failed_count += 1
+            elif result is not None:
                 summaries.append(result)
                 if result.get("status") != "success":
                     failed_count += 1
             else:
                 failed_count += 1
-                logger.warning(f"Q{i} returned None")
 
-            # Small delay between GPT-4o calls
-            await asyncio.sleep(0.5)
 
         if not summaries:
             error = "All summarizations failed"

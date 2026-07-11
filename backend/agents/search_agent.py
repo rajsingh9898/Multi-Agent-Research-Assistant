@@ -167,6 +167,25 @@ def collect_all_source_credibility(search_results: List[Dict[str, Any]]) -> List
         return []
 
 
+async def search_question_with_semaphore(
+    question: str,
+    report_id: str,
+    semaphore: asyncio.Semaphore,
+    index: int,
+    total: int,
+    state: AgentMemory,
+    ws_manager: Any
+) -> Optional[Dict[str, Any]]:
+    async with semaphore:
+        return await search_single_question(
+            question=question,
+            question_index=index,
+            total_questions=total,
+            report_id=report_id,
+            state=state
+        )
+
+
 async def run(state: AgentMemory, report_id: str) -> bool:
     """Run coordinates web search agent pipeline.
 
@@ -197,32 +216,61 @@ async def run(state: AgentMemory, report_id: str) -> bool:
         # -- START --
         await ws_manager.emit_agent_start(
             report_id, "search_agent",
-            f"Searching web for {total} questions..."
+            f"Searching web for {total} questions in parallel..."
         )
 
         state.add_log(
             "search_agent", "start",
-            f"Beginning search for {total} questions"
+            f"Starting parallel search for {total} questions"
         )
 
-        # -- SEARCH EACH QUESTION --
+        # -- PARALLEL SEARCH --
+        # Limit to 3 concurrent Tavily calls
+        semaphore = asyncio.Semaphore(3)
+
+        search_tasks = [
+            search_question_with_semaphore(
+                question=q,
+                report_id=report_id,
+                semaphore=semaphore,
+                index=i+1,
+                total=total,
+                state=state,
+                ws_manager=ws_manager
+            )
+            for i, q in enumerate(sub_questions)
+        ]
+
+        # Run all searches concurrently
+        raw_results = await asyncio.gather(
+            *search_tasks,
+            return_exceptions=True
+        )
+
+        # Process results, handle exceptions
         search_results = []
         failed_questions = []
 
-        for i, question in enumerate(sub_questions, 1):
-            result = await search_single_question(
-                question=question,
-                question_index=i,
-                total_questions=total,
-                report_id=report_id,
-                state=state
-            )
-
-            if result is not None:
+        for i, result in enumerate(raw_results):
+            if isinstance(result, Exception):
+                logger.error(
+                    f"Search Q{i+1} failed: {result}"
+                )
+                failed_questions.append(sub_questions[i])
+                search_results.append({
+                    "question": sub_questions[i],
+                    "sources": [],
+                    "source_count": 0,
+                    "avg_credibility_score": 0
+                })
+            elif result is not None:
                 search_results.append(result)
+                if result.get("source_count", 0) == 0:
+                    failed_questions.append(sub_questions[i])
             else:
-                failed_questions.append(question)
-                logger.warning(f"Question {i} search failed")
+                failed_questions.append(sub_questions[i])
+
+
 
         # -- HANDLE COMPLETE FAILURE --
         if not search_results:

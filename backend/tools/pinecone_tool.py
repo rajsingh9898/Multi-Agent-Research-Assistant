@@ -262,6 +262,40 @@ async def create_embedding(text: str) -> List[float]:
     return [float(value) for value in embedding]
 
 
+async def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    """Creates embeddings for multiple texts in a single OpenAI API call."""
+    if not texts:
+        return []
+
+    cleaned_texts = [
+        (t.replace("\n", " ").strip()[:8000] or " ")
+        for t in texts
+    ]
+
+    from utils.retry import (
+        async_retry,
+        OPENAI_RETRY_EXCEPTIONS
+    )
+
+    @async_retry(
+        max_attempts=3,
+        base_delay=2,
+        exceptions=OPENAI_RETRY_EXCEPTIONS
+    )
+    async def _create_embeddings_batch_with_retry(texts_val):
+        client = get_openai_client()
+        response = client.embeddings.create(
+            input=texts_val,
+            model=EMBEDDING_MODEL
+        )
+        return response.data
+
+    data = await _create_embeddings_batch_with_retry(cleaned_texts)
+    sorted_data = sorted(data, key=lambda x: x.index)
+    return [[float(val) for val in item.embedding] for item in sorted_data]
+
+
+
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
     """Split clean text into semantic character chunks with overlap."""
     if not text:
@@ -312,18 +346,31 @@ async def upsert_source_chunks(
     credibility_payload = credibility or {}
     vectors: List[tuple[str, List[float], Dict[str, Any]]] = []
 
-    for chunk_index, chunk in enumerate(chunks):
+    # Batch chunk embeddings to minimize API call overhead (10 chunks per call)
+    EMBED_BATCH_SIZE = 10
+    all_embeddings = []
+    
+    for i in range(0, len(chunks), EMBED_BATCH_SIZE):
+        batch = chunks[i:i + EMBED_BATCH_SIZE]
         try:
-            embedding = await create_embedding(chunk)
+            embeddings = await create_embeddings_batch(batch)
+            all_embeddings.extend(embeddings)
         except Exception as exc:
             logger.warning(
-                "Skipping chunk %s from source %s because embedding failed: %s",
+                f"Skipping embedding batch starting at index {i} from source {source_url}: {exc}"
+            )
+            all_embeddings.extend([None] * len(batch))
+
+    for chunk_index, chunk in enumerate(chunks):
+        if chunk_index >= len(all_embeddings) or all_embeddings[chunk_index] is None:
+            logger.warning(
+                "Skipping chunk %s from source %s because embedding failed",
                 chunk_index,
                 source_url,
-                exc,
             )
             continue
 
+        embedding = all_embeddings[chunk_index]
         metadata = {
             "report_id": report_id,
             "source_url": source_url,
@@ -344,6 +391,7 @@ async def upsert_source_chunks(
         cleaned_metadata = {k: _metadata_value(v) for k, v in metadata.items()}
         cleaned_metadata = {k: v for k, v in cleaned_metadata.items() if v is not None}
         vectors.append((vector_id, embedding, cleaned_metadata))
+
 
     if not vectors:
         return 0
