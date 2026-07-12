@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  backend:
+    volumes:
+      # Mount backend source code so changes trigger uvicorn hot-reload automatically
+      - ./backend:/app:cached
+    
+    # Overwrite the production command to enable code reloading and verbose debug logging
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --reload-dir /app
+      --log-level debug
+    
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DEBUG=true

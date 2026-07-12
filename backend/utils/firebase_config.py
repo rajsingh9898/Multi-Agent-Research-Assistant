@@ -103,8 +103,42 @@ _MOCK_STORAGE = MockBucket()
 
 # --- HELPER FUNCTIONS ---
 
-def _has_service_account() -> bool:
-    """Determine if a valid Firebase service account JSON file is configured."""
+def _get_firebase_private_key() -> str:
+    """
+    Gets Firebase private key from environment.
+    Handles multiple formats:
+    1. Already has real newlines (from .env file)
+    2. Has escaped \\n (from container env var)
+    3. Wrapped in quotes (from some CLI tools)
+    """
+    key = os.getenv("FIREBASE_PRIVATE_KEY", "")
+    
+    if not key:
+        raise ValueError(
+            "FIREBASE_PRIVATE_KEY not set. Check your environment variables."
+        )
+    
+    # Remove surrounding quotes if present
+    if (key.startswith('"') and key.endswith('"')) or \
+       (key.startswith("'") and key.endswith("'")):
+        key = key[1:-1]
+    
+    # Replace escaped newlines with real newlines
+    if "\\n" in key:
+        key = key.replace("\\n", "\n")
+    
+    # Validate the key format
+    if not key.strip().startswith("-----BEGIN"):
+        raise ValueError(
+            "FIREBASE_PRIVATE_KEY doesn't look valid. "
+            f"Starts with: '{key[:30]}...'"
+        )
+    
+    return key
+
+
+def _has_service_account_file() -> bool:
+    """Check if the service account JSON file actually exists."""
     cred_path = os.getenv("FIREBASE_SERVICE_ACCOUNT")
     if not cred_path:
         return False
@@ -112,6 +146,19 @@ def _has_service_account() -> bool:
     if not path.is_absolute():
         path = (Path(__file__).resolve().parents[1] / path).resolve()
     return path.exists()
+
+
+def _has_service_account() -> bool:
+    """Determine if a valid Firebase configuration or JSON file is configured."""
+    if os.getenv("FIREBASE_SERVICE_ACCOUNT"):
+        return _has_service_account_file()
+    
+    # Otherwise check if environment variable config exists (Docker flow)
+    return bool(
+        os.getenv("FIREBASE_PROJECT_ID") and
+        os.getenv("FIREBASE_PRIVATE_KEY") and
+        os.getenv("FIREBASE_CLIENT_EMAIL")
+    )
 
 
 def _get_service_account_path() -> str:
@@ -135,16 +182,29 @@ def _get_service_account_path() -> str:
 def initialize_firebase() -> Optional[firebase_admin.App]:
     """Initialize Firebase Admin exactly once and return the active app, or Mock App if missing."""
     if not _has_service_account():
-        logger.warning("Firebase service account JSON not found. Operating in MOCK mode.")
-        print("⚠️  Firebase service account JSON not found. Operating in MOCK mode.")
+        logger.warning("Firebase service account configuration not found. Operating in MOCK mode.")
+        print("⚠️  Firebase service account configuration not found. Operating in MOCK mode.")
         return None
 
     try:
         if firebase_admin._apps:
             return firebase_admin.get_app()
 
-        cred_path = _get_service_account_path()
-        cred = credentials.Certificate(cred_path)
+        # Try to initialize using service account file if provided and present
+        if os.getenv("FIREBASE_SERVICE_ACCOUNT") and _has_service_account_file():
+            cred_path = _get_service_account_path()
+            cred = credentials.Certificate(cred_path)
+        else:
+            # Fallback to loading from individual environment variables (Docker flow)
+            cred_dict = {
+                "type": "service_account",
+                "project_id": os.getenv("FIREBASE_PROJECT_ID"),
+                "private_key": _get_firebase_private_key(),
+                "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
+                "token_uri": "https://oauth2.googleapis.com/token"
+            }
+            cred = credentials.Certificate(cred_dict)
+
         project_id = os.getenv("FIREBASE_PROJECT_ID")
         app = firebase_admin.initialize_app(cred, {"projectId": project_id} if project_id else None)
         logger.info("Firebase Admin initialized successfully")
@@ -171,3 +231,4 @@ def get_storage():
     if bucket_name:
         return storage.bucket(bucket_name)
     return storage.bucket()
+

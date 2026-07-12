@@ -1,0 +1,81 @@
+# .dockerignore for Multi-Agent Research Assistant Backend
+# This file prevents unnecessary, large, or sensitive files from being copied into the Docker image.
+
+# ────────────────────────────────────────────────────────
+# SECRETS (Critical for security, never bake credentials into the image)
+# ────────────────────────────────────────────────────────
+.env
+.env.*
+*.env
+.env.local
+.env.production
+
+# ────────────────────────────────────────────────────────
+# PYTHON ARTIFACTS (Not needed for production runtime)
+# ────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ────────────────────────────────────────────────────────
+# VIRTUAL ENVIRONMENT (Massive folders, dependencies installed in container)
+# ────────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+ENV/
+virtualenv/
+
+# ────────────────────────────────────────────────────────
+# TEST FILES (Exclude to keep production image minimal)
+# ────────────────────────────────────────────────────────
+test_*.py
+*_test.py
+tests/
+pytest.ini
+.pytest_cache/
+test_results*.txt
+*.test.py
+
+# ────────────────────────────────────────────────────────
+# DEVELOPMENT FILES (Tooling not used in container execution)
+# ────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+*.md
+README*
+PERFORMANCE_REPORT.md
+postman_collection.json
+
+# ────────────────────────────────────────────────────────
+# IDE AND OS FILES (Developer local configs and OS metadata)
+# ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ────────────────────────────────────────────────────────
+# LOGS AND TEMP (Prevents carrying local logs or temp files)
+# ────────────────────────────────────────────────────────
+*.log
+logs/
+tmp/
+temp/
+cache/
+
+# NOTE: Do NOT exclude the following as they are critical:
+# - assets/ (contains TTF font files needed for report generation and PDF exports)
+# - main.py (FastAPI entry point)
+# - requirements.txt (dependencies specification)
