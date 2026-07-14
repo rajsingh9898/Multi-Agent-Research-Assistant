@@ -57,23 +57,50 @@ app = FastAPI(
 )
 
 # CORS Mappings
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000"
-]
-if FRONTEND_URL:
-    ALLOWED_ORIGINS.append(FRONTEND_URL)
+def get_allowed_origins() -> list[str]:
+    """
+    Builds list of allowed CORS origins.
+    Reads from environment for flexibility.
+    """
+    origins = [
+        # Local development
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "https://localhost:3000",
+        "http://127.0.0.1:3000"
+    ]
+    
+    # Add frontend URL from environment
+    frontend_url = os.getenv("FRONTEND_URL", "")
+    if frontend_url and frontend_url not in origins:
+        origins.append(frontend_url)
+    
+    # Add any additional URLs from env (comma-separated list)
+    extra_origins = os.getenv("EXTRA_CORS_ORIGINS", "")
+    if extra_origins:
+        for url in extra_origins.split(","):
+            url = url.strip()
+            if url and url not in origins:
+                origins.append(url)
+    
+    # Filter out empty strings
+    origins = [o for o in origins if o]
+    logger.info(f"CORS allowed origins: {origins}")
+    return origins
 
-# Add Vercel wildcard matching standard specs
+
+ALLOWED_ORIGINS = get_allowed_origins()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex="https://.*\\.vercel\\.app",
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
+    expose_headers=["*"]
 )
+
 
 # In-memory storage fallback keeps starter test suites functional when Firestore is offline.
 REPORT_STORE: Dict[str, Dict[str, Any]] = {}

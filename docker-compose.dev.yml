@@ -5,7 +5,7 @@ services:
     volumes:
       # Mount backend source code so changes trigger uvicorn hot-reload automatically
       - ./backend:/app:cached
-    
+  
     # Overwrite the production command to enable code reloading and verbose debug logging
     command: >
       uvicorn main:app

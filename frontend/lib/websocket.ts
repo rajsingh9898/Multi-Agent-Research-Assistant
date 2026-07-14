@@ -7,12 +7,19 @@ export interface WSEvent {
 }
 
 const getWsUrl = (reportId: string): string => {
-  const backendUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"
+  const backendUrl =
+    process.env.NEXT_PUBLIC_BACKEND_URL ||
+    process.env.NEXT_PUBLIC_API_URL ||
+    "http://localhost:8000"
+
+  // Convert HTTP → WS, HTTPS → WSS
   const wsUrl = backendUrl
-    .replace("https://", "wss://")
-    .replace("http://", "ws://")
+    .replace(/^https:\/\//, "wss://")
+    .replace(/^http:\/\//, "ws://")
+
   return `${wsUrl}/ws/research/${reportId}`
 }
+
 
 export class ResearchWebSocket {
   private ws: WebSocket | null = null

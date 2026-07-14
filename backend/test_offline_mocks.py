@@ -4,7 +4,6 @@ import json
 import time
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
-
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -15,14 +14,12 @@ if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
-
 class MockChatCompletions:
     def create(self, *args, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         prompt = ""
         for m in messages:
             prompt += m.get("content", "") + "\n"
-
         # Determine agent type from prompt
         if "sub_questions" in prompt or "sub-questions" in prompt:
             if "expert" in prompt.lower() or " 6 " in prompt:
@@ -103,14 +100,11 @@ class MockChatCompletions:
             })
         else:
             content = "{}"
-
         mock_choice = MagicMock()
         mock_choice.message.content = content
         mock_response = MagicMock()
         mock_response.choices = [mock_choice]
         return mock_response
-
-
 class MockEmbeddings:
     def create(self, *args, **kwargs) -> Any:
         mock_embedding = MagicMock()
@@ -118,8 +112,6 @@ class MockEmbeddings:
         mock_response = MagicMock()
         mock_response.data = [mock_embedding]
         return mock_response
-
-
 class MockPineconeIndex:
     def __init__(self):
         self.vectors = {}
@@ -145,7 +137,6 @@ class MockPineconeIndex:
                 "score": 0.9,
                 "metadata": vec.get("metadata", {})
             })
-        
         # Fallback if no vectors saved
         if not matches:
             matches = [
@@ -190,8 +181,6 @@ async def mock_search_tavily(query: str, max_results: int = 4, search_depth: str
         }
         for i in range(max_results)
     ]
-
-
 def is_openai_key_valid() -> bool:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or any(placeholder in api_key.lower() for placeholder in ["replace_with", "your_", "sk-proj-FjFXybv"]):
@@ -204,13 +193,10 @@ def is_openai_key_valid() -> bool:
         return True
     except Exception:
         return False
-
-
 def patch_if_offline():
     """Determine if offline/key invalid, and apply global mocks dynamically."""
     if not is_openai_key_valid():
         print("⚠️  OpenAI API key is missing or invalid. Activating high-fidelity MOCK mode for E2E tests.")
-        
         # 1. Patch OpenAI completions and embeddings
         patchers = [
             patch("openai.resources.chat.completions.Completions.create", new=MockChatCompletions().create),
@@ -220,10 +206,8 @@ def patch_if_offline():
             # 3. Patch Tavily
             patch("tools.tavily_tool.search", new=mock_search_tavily)
         ]
-        
         for p in patchers:
             p.start()
-        
         # Pre-populate index stats mock return values
         import tools.pinecone_tool
         tools.pinecone_tool.get_index_stats = lambda: {

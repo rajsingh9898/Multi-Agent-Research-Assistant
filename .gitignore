@@ -42,3 +42,4 @@ backend/*serviceaccount*.json
 # Never commit generated or secret Firebase credential exports
 firebase-service-account.json
 *.service-account.json
+

@@ -9,7 +9,7 @@ services:
       target: runtime
     
     container_name: research-assistant-backend
-    
+
     ports:
       - "8000:8000"
     
